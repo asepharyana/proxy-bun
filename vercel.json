@@ -1,11 +1,5 @@
 {
 	"$schema": "https://openapi.vercel.sh/vercel.json",
 	"bunVersion": "1",
-	"installCommand": "bun install",
-	"rewrites": [
-		{ "source": "/api", "destination": "/api/index.ts" },
-		{ "source": "/api/(.*)", "destination": "/api/index.ts" },
-		{ "source": "/public/(.*)", "destination": "/public/$1" },
-		{ "source": "/(.*)", "destination": "/public/$1" }
-	]
+	"installCommand": "bun install"
 }
