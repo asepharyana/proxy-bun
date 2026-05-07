@@ -2,5 +2,16 @@
 	"$schema": "https://openapi.vercel.sh/vercel.json",
 	"bunVersion": "1",
 	"installCommand": "bun install",
-	"outputDirectory": "dist"
+	"outputDirectory": "dist",
+	"trailingSlash": false,
+	"rewrites": [
+		{
+			"source": "/api",
+			"destination": "/api/index.ts"
+		},
+		{
+			"source": "/api/(.*)",
+			"destination": "/api/index.ts"
+		}
+	]
 }

@@ -1,6 +1,5 @@
 {
 	"name": "proxy-bun",
-	"module": "api/index.ts",
 	"type": "module",
 	"private": true,
 	"scripts": {
