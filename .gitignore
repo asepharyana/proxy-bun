@@ -5,7 +5,7 @@ node_modules
 out
 dist
 *.tgz
-
+.next/
 # code coverage
 coverage
 *.lcov
@@ -34,3 +34,4 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .DS_Store
 # Added by code-review-graph
 .code-review-graph/
+next-env.d.ts
