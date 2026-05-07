@@ -43,7 +43,7 @@ export default async function handler(req: Request): Promise<Response> {
 	}
 
 	const headers = stripRelayHeaders(new Headers(req.headers));
-	const fetchOptions = buildRelayRequest(req, headers);
+	const fetchOptions = buildRelayRequest(req, targetUrl, headers);
 
 	const response = await fetch(targetUrl, fetchOptions);
 	return createRelayResponse(response);
