@@ -9,12 +9,15 @@ import {
 export const runtime = "edge";
 
 async function handler(req: Request): Promise<Response> {
-	const ALLOWED_METHODS = new Set(["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]);
-
-	if (!ALLOWED_METHODS.has(req.method)) {
-		return new Response(JSON.stringify({ error: "Method not allowed" }), {
-			status: 405,
-			headers: { "content-type": "application/json" },
+	if (req.method === "OPTIONS") {
+		return new Response(null, {
+			status: 204,
+			headers: {
+				"Access-Control-Allow-Origin": "*",
+				"Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+				"Access-Control-Allow-Headers": "*",
+				"Access-Control-Max-Age": "86400",
+			},
 		});
 	}
 
@@ -27,7 +30,7 @@ async function handler(req: Request): Promise<Response> {
 			JSON.stringify({ error: "Missing x-relay-target header" }),
 			{
 				status: 400,
-				headers: { "content-type": "application/json" },
+				headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" },
 			},
 		);
 	}
@@ -37,7 +40,7 @@ async function handler(req: Request): Promise<Response> {
 			JSON.stringify({ error: "Target domain not allowed" }),
 			{
 				status: 403,
-				headers: { "content-type": "application/json" },
+				headers: { "content-type": "application/json", "Access-Control-Allow-Origin": "*" },
 			},
 		);
 	}

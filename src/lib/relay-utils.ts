@@ -95,6 +95,12 @@ export function createRelayResponse(response: Response): Response {
 	headers.delete("transfer-encoding");
 	headers.delete("connection");
 	headers.delete("keep-alive");
+
+	// Add CORS for browser UI
+	headers.set("Access-Control-Allow-Origin", "*");
+	headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
+	headers.set("Access-Control-Allow-Headers", "*");
+
 	return new Response(response.body, {
 		status: response.status,
 		headers,
