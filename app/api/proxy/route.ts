@@ -6,9 +6,7 @@ import {
 	isAllowedTarget,
 } from "@/lib/relay-utils";
 
-export const config = {
-  runtime: 'edge',
-};
+export const runtime = "edge";
 
 async function handler(req: Request): Promise<Response> {
 	const ALLOWED_METHODS = new Set(["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]);
@@ -51,4 +49,10 @@ async function handler(req: Request): Promise<Response> {
 	return createRelayResponse(response);
 }
 
-export default handler;
+export const GET = handler;
+export const POST = handler;
+export const PUT = handler;
+export const DELETE = handler;
+export const PATCH = handler;
+export const HEAD = handler;
+export const OPTIONS = handler;
