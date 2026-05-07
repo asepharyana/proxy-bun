@@ -310,13 +310,13 @@
   <div class="panel">
     <h2>Request Method</h2>
     <div class="method-buttons">
-      <button class="method-btn get active" onclick="setMethod('GET')">GET</button>
-      <button class="method-btn post" onclick="setMethod('POST')">POST</button>
-      <button class="method-btn put" onclick="setMethod('PUT')">PUT</button>
-      <button class="method-btn delete" onclick="setMethod('DELETE')">DELETE</button>
-      <button class="method-btn" onclick="setMethod('PATCH')">PATCH</button>
-      <button class="method-btn" onclick="setMethod('HEAD')">HEAD</button>
-      <button class="method-btn" onclick="setMethod('OPTIONS')">OPTIONS</button>
+      <button class="method-btn get active" data-method="GET" onclick="setMethod('GET')">GET</button>
+      <button class="method-btn post" data-method="POST" onclick="setMethod('POST')">POST</button>
+      <button class="method-btn put" data-method="PUT" onclick="setMethod('PUT')">PUT</button>
+      <button class="method-btn delete" data-method="DELETE" onclick="setMethod('DELETE')">DELETE</button>
+      <button class="method-btn" data-method="PATCH" onclick="setMethod('PATCH')">PATCH</button>
+      <button class="method-btn" data-method="HEAD" onclick="setMethod('HEAD')">HEAD</button>
+      <button class="method-btn" data-method="OPTIONS" onclick="setMethod('OPTIONS')">OPTIONS</button>
     </div>
   </div>
 
@@ -335,13 +335,13 @@
       <div class="form-group" style="flex: 1;">
         <label>Presets</label>
         <div class="presets">
-          <button class="preset-btn" onclick="setBody('empty')">Empty</button>
-          <button class="preset-btn" onclick="setBody('simple')">Simple</button>
-          <button class="preset-btn" onclick="setBody('form')">Form Data</button>
-          <button class="preset-btn" onclick="setBody('large')">Large JSON</button>
+          <button type="button" class="preset-btn" onclick="setBody('empty')">Empty</button>
+          <button type="button" class="preset-btn" onclick="setBody('simple')">Simple</button>
+          <button type="button" class="preset-btn" onclick="setBody('form')">Form Data</button>
+          <button type="button" class="preset-btn" onclick="setBody('large')">Large JSON</button>
         </div>
         <label>Format</label>
-        <button class="preset-btn" onclick="formatJson()">Format JSON</button>
+        <button type="button" class="preset-btn" onclick="formatJson()">Format JSON</button>
       </div>
     </div>
   </div>
@@ -398,11 +398,8 @@
     function setMethod(method) {
       currentMethod = method;
       document.querySelectorAll('.method-btn').forEach(btn => btn.classList.remove('active'));
-      document.querySelector(`.method-btn.${method.toLowerCase()}`)?.classList.add('active') ||
-        document.querySelector(`.method-btn:not([class*=" "])`)?.classList.add('active');
-      // Find the exact button
       document.querySelectorAll('.method-btn').forEach(btn => {
-        if (btn.textContent === method) btn.classList.add('active');
+        if (btn.dataset.method === method) btn.classList.add('active');
       });
     }
 
