@@ -90,11 +90,14 @@ export function isAllowedTarget(url: string): boolean {
 
 export function createRelayResponse(response: Response): Response {
 	const headers = new Headers(response.headers);
+	// Remove headers that would confuse the browser or were handled by the proxy
 	headers.delete("content-encoding");
 	headers.delete("content-length");
 	headers.delete("transfer-encoding");
 	headers.delete("connection");
 	headers.delete("keep-alive");
+	headers.delete("x-frame-options"); // Allow embedding if needed
+	headers.delete("content-security-policy");
 
 	// Add CORS for browser UI
 	headers.set("Access-Control-Allow-Origin", "*");
