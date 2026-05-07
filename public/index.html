@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Edge Proxy Relay</title>
+  <style>
+    body { font-family: monospace; padding: 2rem; background: #1a1a2e; color: #eee; }
+    h1 { color: #00d9ff; }
+    pre { background: #16213e; padding: 1rem; border-radius: 8px; overflow-x: auto; }
+    .log { color: #00ff88; }
+    .error { color: #ff6b6b; }
+    input, button { padding: 0.5rem 1rem; margin: 0.5rem 0; }
+    input { background: #16213e; border: 1px solid #00d9ff; color: #fff; width: 300px; }
+    button { background: #00d9ff; border: none; cursor: pointer; font-weight: bold; }
+    button:hover { background: #00b8d9; }
+  </style>
+</head>
+<body>
+  <h1>Edge Proxy Relay</h1>
+  <p>Forward requests to external APIs via Vercel Edge</p>
+
+  <div>
+    <input type="text" id="target" value="https://httpbin.org/anything" placeholder="Target URL" />
+    <button onclick="sendRequest()">Send Request</button>
+  </div>
+
+  <h3>Response:</h3>
+  <pre id="output" class="log">Waiting for request...</pre>
+
+  <script>
+    async function sendRequest() {
+      const target = document.getElementById('target').value;
+      const output = document.getElementById('output');
+
+      output.textContent = 'Sending request...';
+      output.className = 'log';
+
+      try {
+        const start = Date.now();
+        const res = await fetch('/', {
+          method: 'POST',
+          headers: {
+            'x-relay-target': target,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ hello: 'world', timestamp: Date.now() })
+        });
+
+        const data = await res.json();
+        const elapsed = Date.now() - start;
+
+        output.textContent = JSON.stringify({
+          status: res.status,
+          elapsed: elapsed + 'ms',
+          data
+        }, null, 2);
+        output.className = 'log';
+      } catch (err) {
+        output.textContent = 'Error: ' + err.message;
+        output.className = 'error';
+      }
+    }
+  </script>
+</body>
+</html>
