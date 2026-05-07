@@ -21,10 +21,9 @@ HTTP proxy untuk Vercel Edge Runtime.
 ### Contoh
 
 ```bash
-# Proxy
 curl -H "x-relay-target: https://jsonplaceholder.typicode.com/posts/1" https://proxy-bun.vercel.app/
-
-# Proxy ke endpoint spesifik
+```
+```bash
 curl -H "x-relay-target: https://api.example.com" \
      -H "x-relay-path: /v1/users" \
      https://proxy-bun.vercel.app/
