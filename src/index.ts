@@ -8,7 +8,7 @@ import {
 
 export const config = { runtime: "edge" };
 
-// Only allow safe methods
+// Only allow safe methodsa
 const ALLOWED_METHODS = new Set(["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]);
 
 export default async function handler(req: Request): Promise<Response> {
