@@ -12,9 +12,13 @@
 	"devDependencies": {
 		"@biomejs/biome": "^2.4.14",
 		"@types/bun": "latest",
+		"@types/node": "^25.6.0",
+		"@types/react": "^19.2.14",
+		"@types/react-dom": "^19.2.3",
 		"autoprefixer": "^10.5.0",
 		"postcss": "^8.5.14",
-		"tailwindcss": "^4.2.4"
+		"tailwindcss": "^4.2.4",
+		"typescript": "^6.0.3"
 	},
 	"dependencies": {
 		"@tailwindcss/postcss": "^4.2.4",
