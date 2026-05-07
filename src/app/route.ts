@@ -46,10 +46,7 @@ async function handler(req: Request): Promise<Response> {
 	}
 
 	const headers = filterHeaders(new Headers(req.headers));
-	// Prevent compressed responses (gzip, br) that cause encoding bugs in relay
-	headers.delete("accept-encoding");
-
-	const fetchOptions = buildRelayRequest(req, targetUrl, headers);
+	const fetchOptions = buildRelayRequest(req, headers);
 
 	const response = await fetch(targetUrl, fetchOptions);
 	return createRelayResponse(response);

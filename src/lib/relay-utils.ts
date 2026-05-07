@@ -12,35 +12,25 @@ export const ALLOWED_HEADERS = new Set([
 ]);
 
 export const BLOCKED_HEADERS = new Set([
-	"x-vercel-id",
-	"x-vercel-deployment-url",
-	"x-vercel-oidc-token",
-	"x-vercel-oidc-token-ts",
-	"x-vercel-signature",
-	"x-vercel-edgified",
-	"x-vercel-ip-city",
-	"x-vercel-ip-country",
-	"x-vercel-ip-country-region",
-	"x-vercel-ip-latency",
-	"x-vercel-deployment-config",
-	"x-vercel-rewritten-query",
-	"cf-ray",
-	"cf-connecting-ip",
-	"cf-ipcountry",
-	"cf-ray-id",
-	"x-forwarded-for",
-	"x-forwarded-host",
-	"x-forwarded-proto",
-	"forwarded",
+	"host",
+	"connection",
+	"keep-alive",
+	"proxy-authenticate",
+	"proxy-authorization",
+	"te",
+	"trailers",
+	"transfer-encoding",
+	"upgrade",
+	"x-relay-target",
+	"x-relay-path",
 	"cookie",
 	"set-cookie",
 	"x-real-ip",
-	"x-cluster-client-ip",
+	"x-forwarded-for",
+	"x-forwarded-host",
+	"x-forwarded-proto",
 	"x-api-key",
-	"x-cache",
 ]);
-
-const INTERNAL_HEADERS = new Set(["x-relay-target", "x-relay-path", "host"]);
 
 export function normalizeTargetUrl(target: string | null, relayPath: string): string | null {
 	if (!target) return null;
@@ -51,12 +41,9 @@ export function filterHeaders(headers: Headers): Headers {
 	const filtered = new Headers();
 	for (const [key, value] of headers.entries()) {
 		const lowerKey = key.toLowerCase();
-		if (INTERNAL_HEADERS.has(lowerKey)) continue;
 		if (BLOCKED_HEADERS.has(lowerKey)) continue;
 		if (lowerKey.startsWith("x-vercel-")) continue;
 		if (lowerKey.startsWith("cf-")) continue;
-		if (lowerKey.startsWith("x-forwarded-")) continue;
-		// Forward remaining headers
 		filtered.set(key, value);
 	}
 	return filtered;
@@ -68,7 +55,6 @@ export function shouldSendBody(method: string): boolean {
 
 export function buildRelayRequest(
 	req: Request,
-	targetUrl: string,
 	headers: Headers
 ): RequestInit {
 	return {
@@ -91,13 +77,10 @@ export function isAllowedTarget(url: string): boolean {
 export function createRelayResponse(response: Response): Response {
 	const headers = new Headers(response.headers);
 	// Remove headers that would confuse the browser or were handled by the proxy
-	headers.delete("content-encoding");
 	headers.delete("content-length");
 	headers.delete("transfer-encoding");
 	headers.delete("connection");
 	headers.delete("keep-alive");
-	headers.delete("x-frame-options"); // Allow embedding if needed
-	headers.delete("content-security-policy");
 
 	// Add CORS for browser UI
 	headers.set("Access-Control-Allow-Origin", "*");
