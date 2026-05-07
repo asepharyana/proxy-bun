@@ -28,7 +28,7 @@ export default function Home() {
     if (headerKey && headerValue) {
       headers[headerKey] = headerValue;
     }
-
+    // console.log('Request Headers:', headers);
     try {
       const start = Date.now();
       const fetchOptions: any = {
