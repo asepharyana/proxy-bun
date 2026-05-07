@@ -5,7 +5,7 @@ HTTP proxy untuk Vercel Edge Runtime.
 ## Live Deployment
 
 Endpoint utama: `https://proxy-bun.vercel.app/api/relay`
-
+Endpoint kedua: `https://vercel-relay-bgddcbfit-asepharyana71s-projects.vercel.app`
 ## Cara Pakai
 
 ### Header yang Dibutuhkan
