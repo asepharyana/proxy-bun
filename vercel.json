@@ -1,9 +1,5 @@
 {
 	"$schema": "https://openapi.vercel.sh/vercel.json",
 	"bunVersion": "1",
-<<<<<<< HEAD
 	"installCommand": "bun install"
-=======
-	"rewrites": [{ "source": "/(.*)", "destination": "/api/relay" }]
->>>>>>> parent of cfbc460 (feat: update build output directory to 'dist' in package.json and set outputDirectory in vercel.json)
 }
