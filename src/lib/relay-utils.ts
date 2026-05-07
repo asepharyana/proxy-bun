@@ -1,49 +1,98 @@
-export interface RelayOptions {
-  stripHeaders?: string[];
-}
+export const ALLOWED_HEADERS = new Set([
+	"content-type",
+	"accept",
+	"accept-encoding",
+	"accept-language",
+	"user-agent",
+	"referer",
+	"origin",
+	"authorization",
+	"proxy-authorization",
+	"cache-control",
+]);
+
+export const BLOCKED_HEADERS = new Set([
+	"x-vercel-id",
+	"x-vercel-deployment-url",
+	"x-vercel-oidc-token",
+	"x-vercel-oidc-token-ts",
+	"x-vercel-signature",
+	"x-vercel-edgified",
+	"x-vercel-ip-city",
+	"x-vercel-ip-country",
+	"x-vercel-ip-country-region",
+	"x-vercel-ip-latency",
+	"x-vercel-deployment-config",
+	"x-vercel-rewritten-query",
+	"cf-ray",
+	"cf-connecting-ip",
+	"cf-ipcountry",
+	"cf-ray-id",
+	"x-forwarded-for",
+	"x-forwarded-host",
+	"x-forwarded-proto",
+	"forwarded",
+	"cookie",
+	"set-cookie",
+	"x-real-ip",
+	"x-cluster-client-ip",
+	"x-api-key",
+	"x-cache",
+]);
+
+const INTERNAL_HEADERS = new Set(["x-relay-target", "x-relay-path", "host"]);
 
 export function normalizeTargetUrl(target: string | null, relayPath: string): string | null {
-  if (!target) return null;
-  return target.replace(/\/$/, "") + relayPath;
+	if (!target) return null;
+	return target.replace(/\/$/, "") + relayPath;
 }
 
-export function stripRelayHeaders(headers: Headers): Headers {
-  const stripped = new Headers(headers);
-  stripped.delete("x-relay-target");
-  stripped.delete("x-relay-path");
-  stripped.delete("host");
-  return stripped;
+export function filterHeaders(headers: Headers): Headers {
+	const filtered = new Headers();
+	for (const [key, value] of headers.entries()) {
+		const lowerKey = key.toLowerCase();
+		if (INTERNAL_HEADERS.has(lowerKey)) continue;
+		if (BLOCKED_HEADERS.has(lowerKey)) continue;
+		if (lowerKey.startsWith("x-vercel-")) continue;
+		if (lowerKey.startsWith("cf-")) continue;
+		if (lowerKey.startsWith("x-forwarded-")) continue;
+		// Forward remaining headers
+		filtered.set(key, value);
+	}
+	return filtered;
 }
 
 export function shouldSendBody(method: string): boolean {
-  return method !== "GET" && method !== "HEAD";
+	return method !== "GET" && method !== "HEAD";
 }
 
 export function buildRelayRequest(
-  req: Request,
-  targetUrl: string,
-  headers: Headers
+	req: Request,
+	targetUrl: string,
+	headers: Headers
 ): RequestInit {
-  return {
-    method: req.method,
-    headers,
-    body: shouldSendBody(req.method) ? req.body : undefined,
-    duplex: "half",
-  } as any;
+	return {
+		method: req.method,
+		headers,
+		body: shouldSendBody(req.method) ? req.body : undefined,
+		duplex: "half",
+	} as any;
 }
 
 export function isAllowedTarget(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return ["http:", "https:"].includes(parsed.protocol);
-  } catch {
-    return false;
-  }
+	try {
+		const parsed = new URL(url);
+		return ["http:", "https:"].includes(parsed.protocol);
+	} catch {
+		return false;
+	}
 }
 
 export function createRelayResponse(response: Response): Response {
-  return new Response(response.body, {
-    status: response.status,
-    headers: response.headers,
-  });
+	const headers = new Headers(response.headers);
+	// Ensure CORS for our test page if needed, but usually we just forward
+	return new Response(response.body, {
+		status: response.status,
+		headers,
+	});
 }

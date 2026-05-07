@@ -2,7 +2,7 @@ import {
 	buildRelayRequest,
 	createRelayResponse,
 	normalizeTargetUrl,
-	stripRelayHeaders,
+	filterHeaders,
 	isAllowedTarget,
 } from "@/lib/relay-utils";
 
@@ -50,7 +50,7 @@ async function handler(req: Request): Promise<Response> {
 		);
 	}
 
-	const headers = stripRelayHeaders(new Headers(req.headers));
+	const headers = filterHeaders(new Headers(req.headers));
 	const fetchOptions = buildRelayRequest(req, targetUrl, headers);
 
 	const response = await fetch(targetUrl, fetchOptions);
