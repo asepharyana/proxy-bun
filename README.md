@@ -4,9 +4,10 @@ HTTP proxy untuk Vercel Edge Runtime.
 
 ## Live Deployment
 
+- **Docs/Tester**: `https://proxy-bun.vercel.app/docs`
 - **Utama**: `https://proxy-bun.vercel.app/`
 - **Alternatif**: `https://vercel-relay-alpha-umber.vercel.app/`
-- **Docs/Tester**: `https://proxy-bun.vercel.app/docs`
+- **Alternatif**: `https://proxy-bun-mytheclipse8647-orfq73fe.apn.leapcell.dev`
 
 ## Cara Pakai
 
