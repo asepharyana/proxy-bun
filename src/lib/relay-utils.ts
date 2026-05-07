@@ -90,7 +90,11 @@ export function isAllowedTarget(url: string): boolean {
 
 export function createRelayResponse(response: Response): Response {
 	const headers = new Headers(response.headers);
-	// Ensure CORS for our test page if needed, but usually we just forward
+	headers.delete("content-encoding");
+	headers.delete("content-length");
+	headers.delete("transfer-encoding");
+	headers.delete("connection");
+	headers.delete("keep-alive");
 	return new Response(response.body, {
 		status: response.status,
 		headers,

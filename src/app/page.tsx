@@ -40,7 +40,7 @@ export default function Home() {
         fetchOptions.body = requestBody;
       }
 
-      const res = await fetch('/api/proxy', fetchOptions);
+      const res = await fetch('/api/relay', fetchOptions);
       const elapsed = Date.now() - start;
 
       let responseText = '';
