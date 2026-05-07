@@ -32,6 +32,15 @@ export function buildRelayRequest(
   };
 }
 
+export function isAllowedTarget(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return ["http:", "https:"].includes(parsed.protocol);
+  } catch {
+    return false;
+  }
+}
+
 export function createRelayResponse(response: Response): Response {
   return new Response(response.body, {
     status: response.status,
