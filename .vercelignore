@@ -1,9 +1,0 @@
-dist
-src
-.gitignore
-CLAUDE.md
-README.md
-bun.lock
-biome.json
-tsconfig.json
-package.json
