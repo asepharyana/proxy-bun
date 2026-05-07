@@ -4,7 +4,7 @@ import {
 	normalizeTargetUrl,
 	stripRelayHeaders,
 	isAllowedTarget,
-} from "~/relay-utils";
+} from "./relay-utils";
 
 export const config = { runtime: "edge" };
 
