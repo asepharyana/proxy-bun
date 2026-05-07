@@ -6,19 +6,13 @@ import {
 	isAllowedTarget,
 } from "@/lib/relay-utils";
 
-export const runtime = "edge";
-
-const ALLOWED_METHODS = new Set(["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]);
-
-export async function POST(req: Request) { return await handler(req); }
-export async function GET(req: Request) { return await handler(req); }
-export async function PUT(req: Request) { return await handler(req); }
-export async function DELETE(req: Request) { return await handler(req); }
-export async function PATCH(req: Request) { return await handler(req); }
-export async function HEAD(req: Request) { return await handler(req); }
-export async function OPTIONS(req: Request) { return await handler(req); }
+export const config = {
+  runtime: 'edge',
+};
 
 async function handler(req: Request): Promise<Response> {
+	const ALLOWED_METHODS = new Set(["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]);
+
 	if (!ALLOWED_METHODS.has(req.method)) {
 		return new Response(JSON.stringify({ error: "Method not allowed" }), {
 			status: 405,
@@ -56,3 +50,5 @@ async function handler(req: Request): Promise<Response> {
 	const response = await fetch(targetUrl, fetchOptions);
 	return createRelayResponse(response);
 }
+
+export default handler;
