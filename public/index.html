@@ -38,7 +38,7 @@
 
       try {
         const start = Date.now();
-        const res = await fetch('/', {
+        const res = await fetch('/api', {
           method: 'POST',
           headers: {
             'x-relay-target': target,
