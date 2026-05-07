@@ -14,13 +14,13 @@ HTTP proxy untuk Vercel Edge Runtime.
 ### Contoh
 
 ```bash
-# Proxy ke httpbin.org/get
-curl -H "x-relay-target: https://httpbin.org" https://your-edge-function.vercel.app
+# Proxy
+curl -H "x-relay-target: https://jsonplaceholder.typicode.com/posts/1" https://vercel-relay-alpha-umber.vercel.app/
 
 # Proxy ke endpoint spesifik
 curl -H "x-relay-target: https://api.example.com" \
      -H "x-relay-path: /v1/users" \
-     https://your-edge-function.vercel.app
+     https://vercel-relay-alpha-umber.vercel.app/
 ```
 
 ### HTTP Methods
