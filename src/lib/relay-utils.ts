@@ -28,8 +28,8 @@ export function buildRelayRequest(
     method: req.method,
     headers,
     body: shouldSendBody(req.method) ? req.body : undefined,
-    duplex: "half" as const,
-  };
+    duplex: "half",
+  } as any;
 }
 
 export function isAllowedTarget(url: string): boolean {
