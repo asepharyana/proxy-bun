@@ -4,15 +4,21 @@ import {
 	normalizeTargetUrl,
 	stripRelayHeaders,
 	isAllowedTarget,
-} from "~/relay-utils";
+} from "@/lib/relay-utils";
 
-export const config = { runtime: "edge" };
+export const runtime = "edge";
 
-// Only allow safe methodsa
 const ALLOWED_METHODS = new Set(["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]);
 
-export default async function handler(req: Request): Promise<Response> {
-	// Method validation
+export async function POST(req: Request) { return await handler(req); }
+export async function GET(req: Request) { return await handler(req); }
+export async function PUT(req: Request) { return await handler(req); }
+export async function DELETE(req: Request) { return await handler(req); }
+export async function PATCH(req: Request) { return await handler(req); }
+export async function HEAD(req: Request) { return await handler(req); }
+export async function OPTIONS(req: Request) { return await handler(req); }
+
+async function handler(req: Request): Promise<Response> {
 	if (!ALLOWED_METHODS.has(req.method)) {
 		return new Response(JSON.stringify({ error: "Method not allowed" }), {
 			status: 405,
@@ -34,7 +40,6 @@ export default async function handler(req: Request): Promise<Response> {
 		);
 	}
 
-	// Target validation (SSRF prevention)
 	if (!isAllowedTarget(targetUrl)) {
 		return new Response(
 			JSON.stringify({ error: "Target domain not allowed" }),
@@ -46,7 +51,7 @@ export default async function handler(req: Request): Promise<Response> {
 	}
 
 	const headers = stripRelayHeaders(new Headers(req.headers));
-	const fetchOptions = buildRelayRequest(req, headers);
+	const fetchOptions = buildRelayRequest(req, targetUrl, headers);
 
 	const response = await fetch(targetUrl, fetchOptions);
 	return createRelayResponse(response);
