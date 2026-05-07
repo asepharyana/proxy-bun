@@ -51,7 +51,7 @@ export default function Home() {
         fetchOptions.body = requestBody;
       }
 
-      const res = await fetch('/api/relay', fetchOptions);
+      const res = await fetch('/', fetchOptions);
       const elapsed = Date.now() - start;
 
       let responseText = '';

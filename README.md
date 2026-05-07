@@ -4,8 +4,9 @@ HTTP proxy untuk Vercel Edge Runtime.
 
 ## Live Deployment
 
-Endpoint utama: `https://proxy-bun.vercel.app/api/relay`
-Endpoint kedua: `https://vercel-relay-bgddcbfit-asepharyana71s-projects.vercel.app`
+- **API Endpoint**: `https://proxy-bun.vercel.app/`
+- **Docs/Tester**: `https://proxy-bun.vercel.app/docs`
+
 ## Cara Pakai
 
 ### Header yang Dibutuhkan
@@ -19,12 +20,12 @@ Endpoint kedua: `https://vercel-relay-bgddcbfit-asepharyana71s-projects.vercel.a
 
 ```bash
 # Proxy
-curl -H "x-relay-target: https://jsonplaceholder.typicode.com/posts/1" https://proxy-bun.vercel.app/api/relay
+curl -H "x-relay-target: https://jsonplaceholder.typicode.com/posts/1" https://proxy-bun.vercel.app/
 
 # Proxy ke endpoint spesifik
 curl -H "x-relay-target: https://api.example.com" \
      -H "x-relay-path: /v1/users" \
-     https://proxy-bun.vercel.app/api/relay
+     https://proxy-bun.vercel.app/
 ```
 
 ### HTTP Methods
@@ -57,7 +58,8 @@ HTTP 400 jika `x-relay-target` tidak ada.
 proxy-bun/
 ├── src/
 │   ├── app/
-│   │   └── api/relay/route.ts  # Edge handler
+│   │   ├── docs/page.tsx   # UI / Documentation
+│   │   └── route.ts        # Edge API handler
 │   └── lib/
 │       ├── relay-utils.ts      # Pure functions untuk relay logic
 │       └── relay-utils.test.ts # Unit tests
