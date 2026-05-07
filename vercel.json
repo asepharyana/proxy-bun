@@ -1,1 +1,8 @@
-{ "rewrites": [{ "source": "/(.*)", "destination": "/api/relay" }] }
+{
+	"rewrites": [{ "source": "/(.*)", "destination": "/api/relay" }],
+	"functions": {
+		"api/**/*.ts": {
+			"runtime": "bun"
+		}
+	}
+}
