@@ -6,7 +6,6 @@ import {
 	isAllowedTarget,
 } from "@/lib/relay-utils";
 
-export const runtime = "edge";
 
 async function handler(req: Request): Promise<Response> {
 	if (req.method === "OPTIONS") {
