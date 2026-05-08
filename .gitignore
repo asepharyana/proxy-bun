@@ -35,3 +35,7 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Added by code-review-graph
 .code-review-graph/
 next-env.d.ts
+
+# OpenNext & Wrangler build output
+.open-next/
+.wrangler/
