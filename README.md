@@ -8,6 +8,7 @@ HTTP proxy untuk Vercel Edge Runtime.
 - **Utama**: `https://proxy-bun.vercel.app`
 - **Alternatif**: `https://vercel-relay-alpha-umber.vercel.app`
 - **Alternatif**: `https://proxy-bun-mytheclipse8647-orfq73fe.apn.leapcell.dev`
+- **Alternatif**: `https://opennext-app.superaseph.workers.dev`
 
 ## Cara Pakai
 
