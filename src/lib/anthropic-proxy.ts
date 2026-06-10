@@ -153,17 +153,9 @@ function backendToAnthropicResponse(
 // ─── Streaming: Backend SSE → Anthropic SSE ───────────────────────────────
 
 /**
- * Transform a backend SSE line into Anthropic SSE format.
+ * Transform a backend SSE line into Anthropic SSE content_block_delta events.
  *
- * Anthropic streaming protocol:
- *   event: message_start
- *   data: {"type":"message_start","message":{...}}
- *
- *   event: content_block_delta
- *   data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}
- *
- *   event: message_stop
- *   data: {"type":"message_stop"}
+ * Returns the SSE event string, or null to skip the line.
  */
 function backendLineToAnthropicSSE(
 	line: string,
@@ -177,20 +169,14 @@ function backendLineToAnthropicSSE(
 		const adapted = config.adaptStreamLine(line, {} as any);
 		if (!adapted) return null;
 		if (adapted === "data: [DONE]") {
-			return "event: message_stop\ndata: {\"type\":\"message_stop\"}";
+			return null; // let the stream transformer handle DONE
 		}
 		// Parse the OpenAI-format chunk and convert to Anthropic
 		try {
 			const parsed = JSON.parse(adapted.replace(/^data: /, ""));
 			const text = parsed.choices?.[0]?.delta?.content ?? "";
 			if (!text) return null;
-			return (
-				`event: content_block_delta\ndata: ${JSON.stringify({
-					type: "content_block_delta",
-					index: 0,
-					delta: { type: "text_delta", text },
-				})}`
-			);
+			return formatContentBlockDelta(text);
 		} catch {
 			return null;
 		}
@@ -200,19 +186,13 @@ function backendLineToAnthropicSSE(
 	if (line.startsWith("data: ")) {
 		const raw = line.slice(6);
 		if (raw === "[DONE]") {
-			return "event: message_stop\ndata: {\"type\":\"message_stop\"}";
+			return null; // let the stream transformer handle DONE
 		}
 		try {
 			const parsed = JSON.parse(raw);
 			const text = parsed.choices?.[0]?.delta?.content ?? "";
 			if (!text) return null;
-			return (
-				`event: content_block_delta\ndata: ${JSON.stringify({
-					type: "content_block_delta",
-					index: 0,
-					delta: { type: "text_delta", text },
-				})}`
-			);
+			return formatContentBlockDelta(text);
 		} catch {
 			return null;
 		}
@@ -220,16 +200,19 @@ function backendLineToAnthropicSSE(
 
 	// Plain text chunks
 	if (line.length > 0) {
-		return (
-			`event: content_block_delta\ndata: ${JSON.stringify({
-				type: "content_block_delta",
-				index: 0,
-				delta: { type: "text_delta", text: line },
-			})}`
-		);
+		return formatContentBlockDelta(line);
 	}
 
 	return null;
+}
+
+/** Format a content_block_delta SSE event for a text delta. */
+function formatContentBlockDelta(text: string): string {
+	return `event: content_block_delta\ndata: ${JSON.stringify({
+		type: "content_block_delta",
+		index: 0,
+		delta: { type: "text_delta", text },
+	})}`;
 }
 
 // ─── Stream transformer ────────────────────────────────────────────────────
@@ -242,18 +225,25 @@ function transformAnthropicStream(
 	const reader = body.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
-	let sentStart = false;
+
+	// State machine for Anthropic SSE protocol
+	let phase: "init" | "block" | "done" = "init";
+	let messageId = `msg_${Date.now()}`;
+	let _hasContent = false;
 
 	return new ReadableStream({
 		async pull(controller) {
 			try {
-				// Emit message_start event first
-				if (!sentStart) {
-					sentStart = true;
+				// ── Phase: emit message_start + content_block_start ──────
+				if (phase === "init") {
+					phase = "block";
+					messageId = `msg_${Date.now()}`;
+
+					// message_start
 					const startEvent = `event: message_start\ndata: ${JSON.stringify({
 						type: "message_start",
 						message: {
-							id: `msg_${Date.now()}`,
+							id: messageId,
 							type: "message",
 							role: "assistant",
 							content: [],
@@ -264,18 +254,22 @@ function transformAnthropicStream(
 						},
 					})}`;
 					controller.enqueue(encoder.encode(startEvent + "\n\n"));
+
+					// content_block_start — must precede any deltas
+					const blockStart = `event: content_block_start\ndata: ${JSON.stringify({
+						type: "content_block_start",
+						index: 0,
+						content_block: { type: "text", text: "" },
+					})}`;
+					controller.enqueue(encoder.encode(blockStart + "\n\n"));
 				}
 
-				while (true) {
+				// ── Phase: read stream and emit content_block_delta events ─
+				while (phase === "block") {
 					const { done, value } = await reader.read();
 					if (done) {
-						controller.enqueue(
-							encoder.encode(
-								'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-							),
-						);
-						controller.close();
-						return;
+						phase = "done";
+						break;
 					}
 
 					const chunk = decoder.decode(value, { stream: true });
@@ -284,9 +278,45 @@ function transformAnthropicStream(
 					for (const line of lines) {
 						const adapted = backendLineToAnthropicSSE(line, model, config);
 						if (adapted) {
+							hasContent = true;
 							controller.enqueue(encoder.encode(adapted + "\n\n"));
 						}
 					}
+
+					// Yield control so we don't block — let next pull() continue
+					return;
+				}
+
+				// ── Phase: emit closing events (content_block_stop, message_delta, message_stop) ─
+				if (phase === "done") {
+					phase = "done"; // prevent re-entry
+
+					// content_block_stop
+					controller.enqueue(
+						encoder.encode(
+							'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+						),
+					);
+
+					// message_delta — required before message_stop
+					controller.enqueue(
+						encoder.encode(
+							`event: message_delta\ndata: ${JSON.stringify({
+								type: "message_delta",
+								delta: { stop_reason: "end_turn", stop_sequence: null },
+								usage: { output_tokens: 0 },
+							})}\n\n`,
+						),
+					);
+
+					// message_stop
+					controller.enqueue(
+						encoder.encode(
+							'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+						),
+					);
+
+					controller.close();
 				}
 			} catch (err) {
 				controller.enqueue(
