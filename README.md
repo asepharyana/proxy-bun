@@ -20,7 +20,15 @@ The server starts on `http://localhost:3000` by default.
 
 ---
 
+| Provider | Endpoint |
+|----------|----------|
+| **Primary (Vercel)** | `https://proxy-bun.vercel.app` |
+| **Secondary (CF Workers)** | `https://opennext-app.superaseph.workers.dev` |
+| **Leapcell** | `https://proxy-bun-mytheclipse8647-orfq73fe.apn.leapcell.dev` |
+| **Interactive Docs** | `https://proxy-bun.vercel.app/docs` |
 ## Environment Variables
+
+---
 
 | Variable | Default | Description |
 |----------|---------|-------------|
