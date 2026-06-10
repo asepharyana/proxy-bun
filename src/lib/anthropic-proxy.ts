@@ -5,15 +5,15 @@
  * and routes them to the same backend AI providers as the OpenAI proxy.
  *
  * Translations:
- *   - Anthropic request → backend format (OpenAI-compatible)
- *   - Backend response → Anthropic Messages format
- *   - Backend SSE stream → Anthropic SSE events
+ *   - Anthropic request -> backend format (OpenAI-compatible)
+ *   - Backend response -> Anthropic Messages format
+ *   - Backend SSE stream -> Anthropic SSE events
  */
 
 import type { ProxyPool } from "./proxy-pool";
 import { MODEL_ROUTES, type BackendConfig } from "./ai-proxy";
 
-// ─── Types ───────────────────────────────────────────────────────────────────────
+// --- Types -------------------------------------------------------------------
 
 export interface AnthropicRequest {
 	model: string;
@@ -40,7 +40,7 @@ interface AnthropicResponse {
 	usage: { input_tokens: number; output_tokens: number };
 }
 
-// ─── Model resolution ─────────────────────────────────────────────────────────
+// --- Model resolution ---------------------------------------------------------
 
 /** Resolve a model name to a backend config (uses MODEL_ROUTES directly). */
 function resolveAnthropicModel(
@@ -56,7 +56,7 @@ export function listAnthropicModels(): string[] {
 	return Object.keys(MODEL_ROUTES);
 }
 
-// ─── Translation: Anthropic → Backend (OpenAI-format) ───────────────────────
+// --- Translation: Anthropic -> Backend (OpenAI-format) -------------------------
 
 interface BackendBody {
 	model: string;
@@ -123,7 +123,7 @@ function anthropicToBackend(
 	return base;
 }
 
-// ─── Translation: Backend → Anthropic ──────────────────────────────────────
+// --- Translation: Backend -> Anthropic ----------------------------------------
 
 /**
  * Convert a backend JSON response body into Anthropic Messages format.
@@ -150,7 +150,64 @@ function backendToAnthropicResponse(
 	};
 }
 
-// ─── Streaming: Backend SSE → Anthropic SSE ───────────────────────────────
+// --- Streaming: Backend SSE -> Anthropic SSE ---------------------------------
+
+/**
+ * Accumulate text from an SSE response body (data: lines) into a single string.
+ * Handles Claude Code SSE format: {"type":"text-delta","delta":"..."}
+ */
+function accumulateSSEText(sseBody: string): string {
+	let accumulated = "";
+	for (const rawLine of sseBody.split("\n")) {
+		const trimmed = rawLine.trim();
+		if (!trimmed.startsWith("data: ")) continue;
+		const raw = trimmed.slice(6);
+		if (raw === "[DONE]") continue;
+		try {
+			const parsed = JSON.parse(raw);
+			if (parsed.type === "text-delta" && parsed.delta) {
+				accumulated += parsed.delta;
+			}
+		} catch {
+			// skip unparseable lines
+		}
+	}
+	return accumulated;
+}
+
+/**
+ * Extract text content from a parsed SSE data object regardless of format.
+ *
+ * Handles multiple SSE formats:
+ *   - Claude Code format: { "type": "text-delta", "delta": "..." }
+ *   - OpenAI format:     { "choices": [{ "delta": { "content": "..." } }] }
+ *   - Generic JSON:      { "content": "..." } or { "text": "..." }
+ */
+function extractTextFromSSE(parsed: any): string | null {
+	if (parsed == null) return null;
+
+	// Claude Code / Anthropic SSE: type-based events
+	if (typeof parsed === "object") {
+		switch (parsed.type) {
+			case "text-delta":
+				return parsed.delta ?? null;
+			case "content_block_delta":
+				return parsed.delta?.text ?? parsed.delta?.delta ?? null;
+		}
+	}
+
+	// OpenAI format: choices[0].delta.content
+	const openai = parsed.choices?.[0]?.delta?.content ??
+		parsed.choices?.[0]?.text;
+	if (openai) return openai;
+
+	// Generic fallbacks
+	if (typeof parsed.content === "string") return parsed.content;
+	if (typeof parsed.text === "string") return parsed.text;
+	if (typeof parsed.delta === "string") return parsed.delta;
+
+	return null;
+}
 
 /**
  * Transform a backend SSE line into Anthropic SSE content_block_delta events.
@@ -171,18 +228,18 @@ function backendLineToAnthropicSSE(
 		if (adapted === "data: [DONE]") {
 			return null; // let the stream transformer handle DONE
 		}
-		// Parse the OpenAI-format chunk and convert to Anthropic
+		// Parse the adapted line
 		try {
 			const parsed = JSON.parse(adapted.replace(/^data: /, ""));
-			const text = parsed.choices?.[0]?.delta?.content ?? "";
-			if (!text) return null;
-			return formatContentBlockDelta(text);
+			const text = extractTextFromSSE(parsed);
+			if (text) return formatContentBlockDelta(text);
+			return null;
 		} catch {
 			return null;
 		}
 	}
 
-	// OpenAI-compatible SSE (opencode.ai)
+	// All data: lines -- try to parse as JSON in any format
 	if (line.startsWith("data: ")) {
 		const raw = line.slice(6);
 		if (raw === "[DONE]") {
@@ -190,15 +247,21 @@ function backendLineToAnthropicSSE(
 		}
 		try {
 			const parsed = JSON.parse(raw);
-			const text = parsed.choices?.[0]?.delta?.content ?? "";
-			if (!text) return null;
-			return formatContentBlockDelta(text);
-		} catch {
+			// Skip lifecycle/non-content events
+			if (parsed.type === "start" || parsed.type === "start-step" ||
+				parsed.type === "data-thinking-step" || parsed.type === "text-start" ||
+				parsed.type === "ping") {
+				return null;
+			}
+			const text = extractTextFromSSE(parsed);
+			if (text) return formatContentBlockDelta(text);
 			return null;
+		} catch {
+			// Not JSON -- treat as plain text
 		}
 	}
 
-	// Plain text chunks
+	// Plain text chunks (or non-data lines)
 	if (line.length > 0) {
 		return formatContentBlockDelta(line);
 	}
@@ -215,7 +278,7 @@ function formatContentBlockDelta(text: string): string {
 	})}`;
 }
 
-// ─── Stream transformer ────────────────────────────────────────────────────
+// --- Stream transformer -------------------------------------------------------
 
 function transformAnthropicStream(
 	body: ReadableStream,
@@ -229,12 +292,11 @@ function transformAnthropicStream(
 	// State machine for Anthropic SSE protocol
 	let phase: "init" | "block" | "done" = "init";
 	let messageId = `msg_${Date.now()}`;
-	let _hasContent = false;
 
 	return new ReadableStream({
 		async pull(controller) {
 			try {
-				// ── Phase: emit message_start + content_block_start ──────
+				// --- Phase: emit message_start + content_block_start ------------
 				if (phase === "init") {
 					phase = "block";
 					messageId = `msg_${Date.now()}`;
@@ -255,7 +317,7 @@ function transformAnthropicStream(
 					})}`;
 					controller.enqueue(encoder.encode(startEvent + "\n\n"));
 
-					// content_block_start — must precede any deltas
+					// content_block_start -- must precede any deltas
 					const blockStart = `event: content_block_start\ndata: ${JSON.stringify({
 						type: "content_block_start",
 						index: 0,
@@ -264,7 +326,7 @@ function transformAnthropicStream(
 					controller.enqueue(encoder.encode(blockStart + "\n\n"));
 				}
 
-				// ── Phase: read stream and emit content_block_delta events ─
+				// --- Phase: read stream and emit content_block_delta events -----
 				while (phase === "block") {
 					const { done, value } = await reader.read();
 					if (done) {
@@ -278,16 +340,15 @@ function transformAnthropicStream(
 					for (const line of lines) {
 						const adapted = backendLineToAnthropicSSE(line, model, config);
 						if (adapted) {
-							hasContent = true;
 							controller.enqueue(encoder.encode(adapted + "\n\n"));
 						}
 					}
 
-					// Yield control so we don't block — let next pull() continue
+					// Yield control so we don't block -- let next pull() continue
 					return;
 				}
 
-				// ── Phase: emit closing events (content_block_stop, message_delta, message_stop) ─
+				// --- Phase: emit closing events (content_block_stop, message_delta, message_stop) -
 				if (phase === "done") {
 					phase = "done"; // prevent re-entry
 
@@ -298,7 +359,7 @@ function transformAnthropicStream(
 						),
 					);
 
-					// message_delta — required before message_stop
+					// message_delta -- required before message_stop
 					controller.enqueue(
 						encoder.encode(
 							`event: message_delta\ndata: ${JSON.stringify({
@@ -330,7 +391,7 @@ function transformAnthropicStream(
 	});
 }
 
-// ─── Main handler ─────────────────────────────────────────────────────────
+// --- Main handler -------------------------------------------------------------
 
 /**
  * Handle an Anthropic-compatible messages request.
@@ -396,7 +457,7 @@ export async function handleAnthropicMessages(
 
 	const url = config.url;
 
-	// ── Execute (direct → proxy fallback) ─────────────────────────
+	// ---- Execute (direct -> proxy fallback) --------------------------------
 	let response: Response | undefined;
 
 	for (let attempt = 0; attempt < 3; attempt++) {
@@ -415,18 +476,18 @@ export async function handleAnthropicMessages(
 		try {
 			response = await fetch(url, init);
 			if (response.ok) {
-				// Success — reset proxy failure if we used one
+				// Success -- reset proxy failure if we used one
 				if (proxyPool && proxyPool.size > 0 && init.proxy && attempt > 0) {
 					proxyPool.markSuccess();
 				}
 				break;
 			}
-			// Non-2xx — mark proxy as failed so next attempt rotates
+			// Non-2xx -- mark proxy as failed so next attempt rotates
 			if (proxyPool && proxyPool.size > 0 && init.proxy) {
 				proxyPool.markFailed();
 			}
 		} catch {
-			// Network error — mark proxy as failed, retry
+			// Network error -- mark proxy as failed, retry
 			if (proxyPool && proxyPool.size > 0 && init.proxy) {
 				proxyPool.markFailed();
 			}
@@ -460,7 +521,7 @@ export async function handleAnthropicMessages(
 		);
 	}
 
-	// ── Handle streaming ─────────────────────────────────────────
+	// ---- Handle streaming -------------------------------------------------
 	if (wantsStream) {
 		const transformed = transformAnthropicStream(
 			response.body!,
@@ -479,8 +540,36 @@ export async function handleAnthropicMessages(
 		});
 	}
 
-	// ── Handle non-streaming ─────────────────────────────────────
+	// ---- Handle non-streaming ---------------------------------------------
 	const text = await response.text();
+
+	// Backend may return SSE (data: lines) even for non-streaming requests.
+	// Accumulate all text-delta events to reconstruct the response body.
+	if (text.trimStart().startsWith("data: ")) {
+		const accumulated = accumulateSSEText(text);
+		if (accumulated) {
+			return new Response(
+				JSON.stringify({
+					id: `msg_${Date.now()}`,
+					type: "message",
+					role: "assistant",
+					content: [{ type: "text", text: accumulated }],
+					model: req.model,
+					stop_reason: "end_turn",
+					stop_sequence: null,
+					usage: { input_tokens: 0, output_tokens: 0 },
+				}),
+				{
+					status: 200,
+					headers: {
+						"Content-Type": "application/json",
+						"Access-Control-Allow-Origin": "*",
+					},
+				},
+			);
+		}
+	}
+
 	let parsed: any;
 	try {
 		parsed = JSON.parse(text);
