@@ -352,44 +352,52 @@ async function handleRelay(
 
 	const targetUrlString = targetUrl.toString();
 
-	// ── Attach proxy (if pool is loaded) ────────────────────────────
-	const proxyUrl = proxyPool.getProxyUrl();
-	if (proxyUrl) fetchOptions.proxy = proxyUrl;
+	// ── Execute upstream fetch ──────────────────────────────────────
+	// Strategy: direct first → proxy on failure → rotate on failure
+	let response: Response | undefined;
+	let usedProxy = false;
 
-	// ── Execute upstream fetch (with proxy retry on failure) ─────────
-	let response: Response;
-	let retried = false;
+	for (let attempts = 0; attempts < 3; attempts++) {
+		// Clear proxy on first attempt (direct)
+		if (attempts === 0) {
+			delete fetchOptions.proxy;
+		} else if (attempts === 1 && proxyPool.size > 0) {
+			// Second attempt: use first proxy
+			usedProxy = true;
+			fetchOptions.proxy = proxyPool.getProxyUrl()!;
+		} else if (attempts === 2 && proxyPool.size > 0) {
+			// Third attempt: rotate to next proxy
+			const next = proxyPool.markFailed();
+			if (!next) break;
+			fetchOptions.proxy = proxyPool.getProxyUrl()!;
+		} else {
+			break;
+		}
 
-	for (;;) {
 		try {
 			response = await fetch(targetUrlString, fetchOptions);
+			if (usedProxy) proxyPool.markSuccess();
 			break;
-		} catch (err) {
-			// Rotate proxy on network failure and retry once
-			if (proxyPool.size > 0 && !retried) {
-				retried = true;
-				const next = proxyPool.markFailed();
-				if (next) {
-					fetchOptions.proxy = proxyPool.getProxyUrl()!;
-					continue;
-				}
-			}
-
-			const classified = classifyFetchError(err);
-			logRelayEvent({
-				method,
-				url: requestUrl,
-				status: classified.status,
-				durationMs: Math.round(performance.now() - startTime),
-				error: classified.message,
-				targetUrl: targetUrlString,
-				ip: clientIP,
-			});
-			return createErrorResponse(classified);
+		} catch {
+			// Fall through to next attempt
 		}
 	}
 
-	if (proxyUrl) proxyPool.markSuccess();
+	// All attempts failed — classify the last error
+	if (!response) {
+		const lastErr = new Error("All connection attempts failed");
+		const classified = classifyFetchError(lastErr);
+		logRelayEvent({
+			method,
+			url: requestUrl,
+			status: classified.status,
+			durationMs: Math.round(performance.now() - startTime),
+			error: classified.message,
+			targetUrl: targetUrlString,
+			ip: clientIP,
+		});
+		return createErrorResponse(classified);
+	}
 
 	// ── Build relay response ─────────────────────────────────────────
 	const relayedResponse = createRelayResponse(response);
