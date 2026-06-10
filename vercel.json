@@ -1,9 +1,10 @@
 {
-  "buildCommand": "bun install",
-  "outputDirectory": "dist",
   "functions": {
-    "src/index.ts": {
-      "runtime": "bun@1"
+    "api/relay.ts": {
+      "runtime": "@vercel/node@5"
     }
-  }
+  },
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api/relay" }
+  ]
 }
