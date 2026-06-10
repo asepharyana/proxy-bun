@@ -27,6 +27,7 @@ import {
 import { checkBodySize } from "./middleware/body-limiter";
 import { createRateLimiter } from "./middleware/rate-limiter";
 import { logRelayEvent } from "./middleware/logger";
+import { ProxyPool } from "./lib/proxy-pool";
 
 import type { Server, ServerWebSocket } from "bun";
 
@@ -49,6 +50,13 @@ const rateLimiter = createRateLimiter({
 		10,
 	),
 });
+
+// ─── Proxy pool (optional) ───────────────────────────────────────────────────────
+
+const proxyPool = new ProxyPool();
+proxyPool.tryLoad(
+	process.env.PROXY_FILE || process.env.PROXY_LIST || "./proxy.txt",
+);
 
 // ─── WebSocket relay data type ──────────────────────────────────────────────────
 
@@ -340,27 +348,48 @@ async function handleRelay(
 		req,
 		filteredHeaders,
 		RELAY_TIMEOUT_MS,
-	);
+	) as RequestInit & { proxy?: string };
 
 	const targetUrlString = targetUrl.toString();
 
-	// ── Execute upstream fetch ───────────────────────────────────────
+	// ── Attach proxy (if pool is loaded) ────────────────────────────
+	const proxyUrl = proxyPool.getProxyUrl();
+	if (proxyUrl) fetchOptions.proxy = proxyUrl;
+
+	// ── Execute upstream fetch (with proxy retry on failure) ─────────
 	let response: Response;
-	try {
-		response = await fetch(targetUrlString, fetchOptions);
-	} catch (err) {
-		const classified = classifyFetchError(err);
-		logRelayEvent({
-			method,
-			url: requestUrl,
-			status: classified.status,
-			durationMs: Math.round(performance.now() - startTime),
-			error: classified.message,
-			targetUrl: targetUrlString,
-			ip: clientIP,
-		});
-		return createErrorResponse(classified);
+	let retried = false;
+
+	for (;;) {
+		try {
+			response = await fetch(targetUrlString, fetchOptions);
+			break;
+		} catch (err) {
+			// Rotate proxy on network failure and retry once
+			if (proxyPool.size > 0 && !retried) {
+				retried = true;
+				const next = proxyPool.markFailed();
+				if (next) {
+					fetchOptions.proxy = proxyPool.getProxyUrl()!;
+					continue;
+				}
+			}
+
+			const classified = classifyFetchError(err);
+			logRelayEvent({
+				method,
+				url: requestUrl,
+				status: classified.status,
+				durationMs: Math.round(performance.now() - startTime),
+				error: classified.message,
+				targetUrl: targetUrlString,
+				ip: clientIP,
+			});
+			return createErrorResponse(classified);
+		}
 	}
+
+	if (proxyUrl) proxyPool.markSuccess();
 
 	// ── Build relay response ─────────────────────────────────────────
 	const relayedResponse = createRelayResponse(response);
