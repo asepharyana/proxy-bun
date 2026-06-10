@@ -43,6 +43,26 @@ const RELAY_TIMEOUT_MS = Number.parseInt(
 const SERVER_START_TIME = Date.now();
 const RELAY_VERSION = "1.0.0";
 
+// ─── API Key Authentication ─────────────────────────────────────────────────────
+
+const API_KEY = process.env.API_KEY ?? "";
+
+/**
+ * Check if a request is authorized.
+ * Returns a 401 Response if unauthorized, or null if allowed.
+ * When API_KEY is empty, all requests pass through.
+ */
+function requireAuth(req: Request): Response | null {
+	if (!API_KEY) return null; // auth disabled
+	const header = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? "";
+	const key = header.replace(/^Bearer\s+/i, "").trim();
+	if (key === API_KEY) return null;
+	return new Response(
+		JSON.stringify({ error: { message: "Unauthorized", type: "auth_error" } }),
+		{ status: 401, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+	);
+}
+
 // ─── Middleware instances (singletons) ───────────────────────────────────────────
 
 const rateLimiter = createRateLimiter({
@@ -483,6 +503,8 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 			if (req.method !== "POST") {
 				return new Response("Method Not Allowed", { status: 405 });
 			}
+			const authErr = requireAuth(req);
+			if (authErr) return authErr;
 			try {
 				const body = await req.json();
 				return handleChatCompletion(body, proxyPool);
@@ -502,6 +524,8 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 			if (req.method !== "POST") {
 				return new Response("Method Not Allowed", { status: 405 });
 			}
+			const authErr = requireAuth(req);
+			if (authErr) return authErr;
 			try {
 				const body = await req.json();
 				return handleAnthropicMessages(body, proxyPool);
@@ -517,6 +541,8 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 		}
 
 		if (url.pathname === "/v1/models" && req.method === "GET") {
+			const authErr = requireAuth(req);
+			if (authErr) return authErr;
 			return new Response(
 				JSON.stringify({
 					object: "list",

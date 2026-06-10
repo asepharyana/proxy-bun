@@ -40,6 +40,8 @@ export interface Env {
 	RATE_LIMIT_WINDOW_MS?: string;
 	/** Server listen port (unused on Workers, here for local dev compatibility) */
 	PORT?: string;
+	/** API key for AI proxy auth (empty = disabled) */
+	API_KEY?: string;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────────
@@ -64,6 +66,19 @@ function getClientIP(req: Request): string {
 	if (cfIp) return cfIp;
 
 	return "unknown";
+}
+
+// ─── Auth Helper ─────────────────────────────────────────────────────────────────
+
+function requireAuth(req: Request, apiKey: string | undefined): Response | null {
+	if (!apiKey) return null; // auth disabled
+	const header = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? "";
+	const key = header.replace(/^Bearer\s+/i, "").trim();
+	if (key === apiKey) return null;
+	return new Response(
+		JSON.stringify({ error: { message: "Unauthorized", type: "auth_error" } }),
+		{ status: 401, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+	);
 }
 
 // ─── Route Handlers ──────────────────────────────────────────────────────────────
@@ -396,6 +411,8 @@ export default {
 		if (url.pathname === "/v1/chat/completions") {
 			if (req.method === "OPTIONS") return createCorsPreflightResponse();
 			if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+			const authErr = requireAuth(req, env.API_KEY);
+			if (authErr) return authErr;
 			try {
 				const body = await req.json();
 				return handleChatCompletion(body);
@@ -411,6 +428,8 @@ export default {
 		if (url.pathname === "/v1/messages") {
 			if (req.method === "OPTIONS") return createCorsPreflightResponse();
 			if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+			const authErr = requireAuth(req, env.API_KEY);
+			if (authErr) return authErr;
 			try {
 				const body = await req.json();
 				return handleAnthropicMessages(body);
@@ -424,6 +443,8 @@ export default {
 
 		// Models list
 		if (url.pathname === "/v1/models" && req.method === "GET") {
+			const authErr = requireAuth(req, env.API_KEY);
+			if (authErr) return authErr;
 			const models = listModels().map((id) => ({
 				id,
 				object: "model",

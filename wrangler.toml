@@ -12,3 +12,4 @@ workers_dev = true
 # RELAY_TIMEOUT_MS = "30000"
 # RATE_LIMIT_MAX = "200"
 # RATE_LIMIT_WINDOW_MS = "60000"
+# API_KEY = "sk-your-secret-key"
