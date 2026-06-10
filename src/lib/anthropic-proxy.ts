@@ -126,7 +126,7 @@ function anthropicToBackend(
 	}
 
 	const base: BackendBody = {
-		model: backendModel,
+		model: anthReq.model,
 		messages,
 		max_tokens: anthReq.max_tokens,
 		temperature: anthReq.temperature,
@@ -144,7 +144,7 @@ function anthropicToBackend(
 	// If backend has a custom adaptRequest, use it
 	if (config.adaptRequest) {
 		return config.adaptRequest({
-			model: backendModel,
+			model: anthReq.model,
 			messages,
 			temperature: anthReq.temperature,
 			max_tokens: anthReq.max_tokens,
