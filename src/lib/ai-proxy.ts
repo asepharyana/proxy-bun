@@ -46,7 +46,8 @@ export interface BackendConfig {
 
 // ─── Model routing table ─────────────────────────────────────────────────────────
 
-const MODEL_ROUTES: Record<string, BackendConfig> = {
+/** Map of model name → backend configuration. Exported for reuse by anthropic-proxy. */
+export const MODEL_ROUTES: Record<string, BackendConfig> = {
 	// ── opencode.ai (OpenAI-compatible — passthrough) ────────────────
 	"deepseek-v4-flash-free": {
 		provider: "opencode",

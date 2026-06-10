@@ -29,6 +29,7 @@ import { createRateLimiter } from "./middleware/rate-limiter";
 import { logRelayEvent } from "./middleware/logger";
 import { ProxyPool } from "./lib/proxy-pool";
 import { handleChatCompletion, listModels } from "./lib/ai-proxy";
+import { handleAnthropicMessages, listAnthropicModels } from "./lib/anthropic-proxy";
 
 import type { Server, ServerWebSocket } from "bun";
 
@@ -492,6 +493,29 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 				);
 			}
 		}
+
+		// AI proxy routes — Anthropic-compatible API
+		if (url.pathname === "/v1/messages") {
+			if (req.method === "OPTIONS") {
+				return createCorsPreflightResponse();
+			}
+			if (req.method !== "POST") {
+				return new Response("Method Not Allowed", { status: 405 });
+			}
+			try {
+				const body = await req.json();
+				return handleAnthropicMessages(body, proxyPool);
+			} catch (e) {
+				return new Response(
+					JSON.stringify({
+						type: "error",
+						error: { message: "Invalid JSON body", type: "invalid_request_error" },
+					}),
+					{ status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+				);
+			}
+		}
+
 		if (url.pathname === "/v1/models" && req.method === "GET") {
 			return new Response(
 				JSON.stringify({
