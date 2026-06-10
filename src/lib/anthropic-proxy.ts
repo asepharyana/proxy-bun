@@ -408,7 +408,7 @@ export async function handleAnthropicMessages(
 		} else if (attempt === 1 && proxyPool && proxyPool.size > 0) {
 			init.proxy = proxyPool.getProxyUrl()!;
 		} else if (attempt >= 2 && proxyPool && proxyPool.size > 0) {
-			const next = proxyPool.markFailed();
+			const next = proxyPool.rotate();
 			if (!next) break;
 			init.proxy = proxyPool.getProxyUrl()!;
 		} else {
