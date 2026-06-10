@@ -45,15 +45,9 @@ const RELAY_VERSION = "1.0.0";
 
 // ─── API Key Authentication ─────────────────────────────────────────────────────
 
-const API_KEY = process.env.API_KEY ?? "";
+const API_KEY = "sk-dummy-key";
 
-/**
- * Check if a request is authorized.
- * Returns a 401 Response if unauthorized, or null if allowed.
- * When API_KEY is empty, all requests pass through.
- */
 function requireAuth(req: Request): Response | null {
-	if (!API_KEY) return null; // auth disabled
 	const header = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? "";
 	const key = header.replace(/^Bearer\s+/i, "").trim();
 	if (key === API_KEY) return null;

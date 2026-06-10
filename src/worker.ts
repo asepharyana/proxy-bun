@@ -70,11 +70,10 @@ function getClientIP(req: Request): string {
 
 // ─── Auth Helper ─────────────────────────────────────────────────────────────────
 
-function requireAuth(req: Request, apiKey: string | undefined): Response | null {
-	if (!apiKey) return null; // auth disabled
+function requireAuth(req: Request): Response | null {
 	const header = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? "";
 	const key = header.replace(/^Bearer\s+/i, "").trim();
-	if (key === apiKey) return null;
+	if (key === "sk-dummy-key") return null;
 	return new Response(
 		JSON.stringify({ error: { message: "Unauthorized", type: "auth_error" } }),
 		{ status: 401, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
@@ -411,7 +410,7 @@ export default {
 		if (url.pathname === "/v1/chat/completions") {
 			if (req.method === "OPTIONS") return createCorsPreflightResponse();
 			if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
-			const authErr = requireAuth(req, env.API_KEY);
+			const authErr = requireAuth(req);
 			if (authErr) return authErr;
 			try {
 				const body = await req.json();
@@ -428,7 +427,7 @@ export default {
 		if (url.pathname === "/v1/messages") {
 			if (req.method === "OPTIONS") return createCorsPreflightResponse();
 			if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
-			const authErr = requireAuth(req, env.API_KEY);
+			const authErr = requireAuth(req);
 			if (authErr) return authErr;
 			try {
 				const body = await req.json();
@@ -443,7 +442,7 @@ export default {
 
 		// Models list
 		if (url.pathname === "/v1/models" && req.method === "GET") {
-			const authErr = requireAuth(req, env.API_KEY);
+			const authErr = requireAuth(req);
 			if (authErr) return authErr;
 			const models = listModels().map((id) => ({
 				id,

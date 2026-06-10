@@ -41,10 +41,9 @@ const RELAY_VERSION = "1.0.0";
 
 // ─── API Key Authentication ─────────────────────────────────────────────────────
 
-const API_KEY = process.env.API_KEY ?? "";
+const API_KEY = "sk-dummy-key";
 
 function requireAuth(req: Request): Response | null {
-	if (!API_KEY) return null;
 	const header = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? "";
 	const key = header.replace(/^Bearer\s+/i, "").trim();
 	if (key === API_KEY) return null;
