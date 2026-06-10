@@ -1,8 +1,9 @@
 /**
- * Vercel-compatible relay handler.
+ * Vercel-compatible relay handler (Bun runtime).
  *
  * This file is the entry point for Vercel serverless function deployments.
- * It exports a `default` fetch handler that Vercel invokes per-request.
+ * It exports `{ fetch }` — the contract Vercel's Bun runtime expects for
+ * serverless functions.
  *
  * It reuses the same relay logic from `src/lib/` and `src/middleware/` as
  * the standalone Bun.serve() server, but:
@@ -348,41 +349,46 @@ async function handleRelay(req: Request): Promise<Response> {
 // ─── Exported Vercel Function Handler ───────────────────────────────────────────
 
 /**
- * Vercel serverless function handler.
+ * Vercel Bun runtime handler.
  *
- * Invoked per-request by Vercel's infrastructure. Handles routing,
- * middleware, and relay logic — same semantics as the standalone
- * Bun.serve() server, minus WebSocket support.
+ * Vercel's Bun runtime expects a `default` export that is an object with
+ * a `fetch` method — NOT a bare default function.  This matches the
+ * standard `Bun.serve()` handler shape.
+ *
+ * Handles routing, middleware, and relay logic — same semantics as the
+ * standalone Bun.serve() server, minus WebSocket support.
  */
-export default async function handler(req: Request): Promise<Response> {
-	const url = new URL(req.url);
+export default {
+	async fetch(req: Request): Promise<Response> {
+		const url = new URL(req.url);
 
-	// Static routes
-	if (url.pathname === "/health") return handleHealth();
-	if (url.pathname === "/docs") return handleDocs();
-	if (url.pathname === "/" && req.method === "GET") return handleIndex();
+		// Static routes
+		if (url.pathname === "/health") return handleHealth();
+		if (url.pathname === "/docs") return handleDocs();
+		if (url.pathname === "/" && req.method === "GET") return handleIndex();
 
-	// WebSocket upgrade — not supported in Vercel Functions
-	if (
-		req.method === "GET" &&
-		req.headers.get("upgrade")?.toLowerCase() === "websocket"
-	) {
-		return new Response(
-			JSON.stringify({
-				error: true,
-				code: "UNSUPPORTED",
-				message: "WebSocket relay is not supported on this deployment",
-			}),
-			{
-				status: 400,
-				headers: {
-					"Content-Type": "application/json",
-					"Access-Control-Allow-Origin": "*",
+		// WebSocket upgrade — not supported in Vercel Functions
+		if (
+			req.method === "GET" &&
+			req.headers.get("upgrade")?.toLowerCase() === "websocket"
+		) {
+			return new Response(
+				JSON.stringify({
+					error: true,
+					code: "UNSUPPORTED",
+					message: "WebSocket relay is not supported on this deployment",
+				}),
+				{
+					status: 400,
+					headers: {
+						"Content-Type": "application/json",
+						"Access-Control-Allow-Origin": "*",
+					},
 				},
-			},
-		);
-	}
+			);
+		}
 
-	// Generic HTTP relay
-	return handleRelay(req);
-}
+		// Generic HTTP relay
+		return handleRelay(req);
+	},
+};

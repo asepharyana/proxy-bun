@@ -1,9 +1,5 @@
 {
-  "functions": {
-    "api/relay.ts": {
-      "runtime": "@vercel/node@5"
-    }
-  },
+  "bunVersion": "1.x",
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/relay" }
   ]
