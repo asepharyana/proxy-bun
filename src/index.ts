@@ -5,12 +5,14 @@
  * `x-relay-target` request header.  Supports WebSocket upgrades
  * when the target uses `ws://` or `wss://`.
  *
- * ── Environment Variables ───────────────────────────────────────
+ * --- Environment Variables ----------------------------------------------------
  * PORT                — Server listen port (default: 3000)
  * RELAY_TIMEOUT_MS    — Upstream fetch timeout (default: 30_000)
  * BODY_MAX_BYTES      — Maximum accepted request body (default: 1_048_576)
  * RATE_LIMIT_MAX      — Max requests per sliding window (default: 100)
  * RATE_LIMIT_WINDOW_MS— Sliding window duration  (default: 60_000)
+ * CORS_ORIGIN         — Allowed CORS origin (default: *)
+ * NODE_ENV            — Set to "production" to disable dev features
  */
 
 import {
@@ -22,6 +24,7 @@ import {
 	classifyFetchError,
 	createErrorResponse,
 	createCorsPreflightResponse,
+	getCorsHeaders,
 } from "./lib/relay-utils";
 
 import { checkBodySize } from "./middleware/body-limiter";
@@ -30,10 +33,11 @@ import { logRelayEvent } from "./middleware/logger";
 import { ProxyPool } from "./lib/proxy-pool";
 import { handleChatCompletion, listModels } from "./lib/ai-proxy";
 import { handleAnthropicMessages } from "./lib/anthropic-proxy";
+import { fetchWithRetry, closeAllActiveReaders, isDevMode } from "./lib/fetch-utils";
 
 import type { Server, ServerWebSocket } from "bun";
 
-// ─── Configuration ──────────────────────────────────────────────────────────────
+// --- Configuration ------------------------------------------------------------
 
 const PORT = Number.parseInt(process.env.PORT ?? "3000", 10);
 const RELAY_TIMEOUT_MS = Number.parseInt(
@@ -43,9 +47,9 @@ const RELAY_TIMEOUT_MS = Number.parseInt(
 const SERVER_START_TIME = Date.now();
 const RELAY_VERSION = "1.0.0";
 
-// ─── API Key Authentication ─────────────────────────────────────────────────────
+// --- API Key Authentication ---------------------------------------------------
 
-const API_KEY = "sk-dummy-key";
+const API_KEY = process.env.API_KEY ?? "sk-dummy-key";
 
 function requireAuth(req: Request): Response | null {
 	const header = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? "";
@@ -53,11 +57,14 @@ function requireAuth(req: Request): Response | null {
 	if (key === API_KEY) return null;
 	return new Response(
 		JSON.stringify({ error: { message: "Unauthorized", type: "auth_error" } }),
-		{ status: 401, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+		{
+			status: 401,
+			headers: { "Content-Type": "application/json", ...getCorsHeaders() },
+		},
 	);
 }
 
-// ─── Middleware instances (singletons) ───────────────────────────────────────────
+// --- Middleware instances (singletons) ----------------------------------------
 
 const rateLimiter = createRateLimiter({
 	maxRequests: Number.parseInt(process.env.RATE_LIMIT_MAX ?? "100", 10),
@@ -67,14 +74,14 @@ const rateLimiter = createRateLimiter({
 	),
 });
 
-// ─── Proxy pool (optional) ───────────────────────────────────────────────────────
+// --- Proxy pool (optional) ----------------------------------------------------
 
 const proxyPool = new ProxyPool();
 proxyPool.tryLoad(
 	process.env.PROXY_FILE || process.env.PROXY_LIST || "./proxy.txt",
 );
 
-// ─── WebSocket relay data type ──────────────────────────────────────────────────
+// --- WebSocket relay data type -----------------------------------------------
 
 interface WSRelayData {
 	target: string;
@@ -82,7 +89,7 @@ interface WSRelayData {
 	upstream?: WebSocket;
 }
 
-// ─── Route handlers ────────────────────────────────────────────────────────────
+// --- Route handlers ----------------------------------------------------------
 
 /** Health check endpoint: returns status, uptime, and version. */
 function handleHealth(): Response {
@@ -96,7 +103,7 @@ function handleHealth(): Response {
 			status: 200,
 			headers: {
 				"Content-Type": "application/json",
-				"Access-Control-Allow-Origin": "*",
+				...getCorsHeaders(),
 			},
 		},
 	);
@@ -189,7 +196,7 @@ ws.onmessage = (e) => console.log("Got:", e.data);</code></pre>
 		status: 200,
 		headers: {
 			"Content-Type": "text/html; charset=utf-8",
-			"Access-Control-Allow-Origin": "*",
+			...getCorsHeaders(),
 		},
 	});
 }
@@ -229,7 +236,7 @@ function handleIndex(): Response {
 	});
 }
 
-// ─── HTTP Relay Logic ──────────────────────────────────────────────────────────
+// --- HTTP Relay Logic -------------------------------------------------------
 
 /**
  * Get the client IP address from the request.
@@ -271,12 +278,12 @@ async function handleRelay(
 	const clientIP = getClientIP(req, ipGetter);
 	const requestUrl = req.url;
 
-	// ── Pre-flight CORS ──────────────────────────────────────────────
+	// -- Pre-flight CORS --------------------------------------------------------
 	if (method === "OPTIONS") {
 		return createCorsPreflightResponse();
 	}
 
-	// ── Middleware: Body size check ──────────────────────────────────
+	// -- Middleware: Body size check -------------------------------------------
 	const bodyError = checkBodySize(req);
 	if (bodyError) {
 		logRelayEvent({
@@ -289,7 +296,7 @@ async function handleRelay(
 		return bodyError;
 	}
 
-	// ── Middleware: Rate limiting ────────────────────────────────────
+	// -- Middleware: Rate limiting ---------------------------------------------
 	const rateCheck = rateLimiter.check(clientIP);
 	if (!rateCheck.allowed) {
 		logRelayEvent({
@@ -311,7 +318,7 @@ async function handleRelay(
 				status: 429,
 				headers: {
 					"Content-Type": "application/json",
-					"Access-Control-Allow-Origin": "*",
+					...getCorsHeaders(),
 					"Retry-After": String(
 						Math.ceil((rateCheck.retryAfterMs ?? 60_000) / 1000),
 					),
@@ -320,11 +327,11 @@ async function handleRelay(
 		);
 	}
 
-	// ── Extract relay parameters from headers ───────────────────────
+	// -- Extract relay parameters from headers ---------------------------------
 	const target = req.headers.get("x-relay-target");
 	const relayPath = req.headers.get("x-relay-path") ?? "/";
 
-	// ── SSRF: Normalize and validate target URL ──────────────────────
+	// -- SSRF: Normalize and validate target URL --------------------------------
 	const targetUrl = normalizeTargetUrl(target, relayPath);
 	if (!targetUrl) {
 		logRelayEvent({
@@ -358,7 +365,7 @@ async function handleRelay(
 		});
 	}
 
-	// ── Build the upstream request ───────────────────────────────────
+	// -- Build the upstream request ---------------------------------------------
 	const filteredHeaders = filterRequestHeaders(req.headers);
 	const fetchOptions = buildRelayRequest(
 		req,
@@ -368,55 +375,28 @@ async function handleRelay(
 
 	const targetUrlString = targetUrl.toString();
 
-	// ── Execute upstream fetch ──────────────────────────────────────
-	// Strategy: direct first → proxy on failure → rotate on failure
-	let response: Response | undefined;
-	let usedProxy = false;
+	// -- Execute upstream fetch with shared retry -------------------------------
+	const result = await fetchWithRetry(
+		targetUrlString,
+		fetchOptions,
+		proxyPool,
+		"relay",
+	);
 
-	for (let attempts = 0; attempts < 3; attempts++) {
-		// Clear proxy on first attempt (direct)
-		if (attempts === 0) {
-			delete fetchOptions.proxy;
-		} else if (attempts === 1 && proxyPool.size > 0) {
-			// Second attempt: use first proxy
-			usedProxy = true;
-			fetchOptions.proxy = proxyPool.getProxyUrl()!;
-		} else if (attempts === 2 && proxyPool.size > 0) {
-			// Third attempt: rotate to next proxy
-			const next = proxyPool.markFailed();
-			if (!next) break;
-			fetchOptions.proxy = proxyPool.getProxyUrl()!;
-		} else {
-			break;
-		}
-
-		try {
-			response = await fetch(targetUrlString, fetchOptions);
-			if (usedProxy) proxyPool.markSuccess();
-			break;
-		} catch {
-			// Fall through to next attempt
-		}
-	}
-
-	// All attempts failed — classify the last error
-	if (!response) {
-		const lastErr = new Error("All connection attempts failed");
-		const classified = classifyFetchError(lastErr);
+	if (result.errorClassification) {
 		logRelayEvent({
 			method,
 			url: requestUrl,
-			status: classified.status,
+			status: result.errorClassification.status,
 			durationMs: Math.round(performance.now() - startTime),
-			error: classified.message,
+			error: result.errorClassification.message,
 			targetUrl: targetUrlString,
 			ip: clientIP,
 		});
-		return createErrorResponse(classified);
+		return createErrorResponse(result.errorClassification);
 	}
 
-	// ── Build relay response ─────────────────────────────────────────
-	const relayedResponse = createRelayResponse(response);
+	const relayedResponse = createRelayResponse(result.response!);
 
 	logRelayEvent({
 		method,
@@ -430,7 +410,7 @@ async function handleRelay(
 	return relayedResponse;
 }
 
-// ─── WebSocket Relay Logic ─────────────────────────────────────────────────────
+// --- WebSocket Relay Logic ---------------------------------------------------
 
 /**
  * Upgrade an HTTP request to a WebSocket and relay bidirectionally to the
@@ -452,7 +432,6 @@ function handleWebSocketUpgrade(
 
 	const relayPath = req.headers.get("x-relay-path") ?? "/";
 
-	// Normalize the target URL to verify it's valid
 	const normalized = normalizeTargetUrl(target, relayPath);
 	if (!normalized) return undefined;
 	if (!isAllowedTarget(new URL(normalized.toString()))) return undefined;
@@ -467,18 +446,14 @@ function handleWebSocketUpgrade(
 		return new Response("WebSocket upgrade failed", { status: 400 });
 	}
 
-	// Returning undefined signals Bun that the upgrade was handled
 	return undefined;
 }
 
-// ─── Server ─────────────────────────────────────────────────────────────────────
+// --- Server ------------------------------------------------------------------
 
 const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 	port: PORT,
-	development: {
-		hmr: true,
-		console: true,
-	},
+	development: isDevMode() ? { hmr: true, console: true } : undefined,
 
 	async fetch(req: Request): Promise<Response | undefined> {
 		const url = new URL(req.url);
@@ -487,9 +462,9 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 		if (url.pathname === "/health") return handleHealth();
 		if (url.pathname === "/docs") return handleDocs();
 		if (url.pathname === "/" && req.method === "GET" && !req.headers.get("x-relay-target"))
-		return handleIndex();
+			return handleIndex();
 
-		// AI proxy routes — OpenAI-compatible API
+		// AI proxy routes -- OpenAI-compatible API
 		if (url.pathname === "/v1/chat/completions") {
 			if (req.method === "OPTIONS") {
 				return createCorsPreflightResponse();
@@ -502,15 +477,15 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 			try {
 				const body = await req.json();
 				return handleChatCompletion(body, proxyPool);
-			} catch (e) {
+			} catch {
 				return new Response(
 					JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }),
-					{ status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+					{ status: 400, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
 				);
 			}
 		}
 
-		// AI proxy routes — Anthropic-compatible API
+		// AI proxy routes -- Anthropic-compatible API
 		if (url.pathname === "/v1/messages") {
 			if (req.method === "OPTIONS") {
 				return createCorsPreflightResponse();
@@ -523,13 +498,13 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 			try {
 				const body = await req.json();
 				return handleAnthropicMessages(body, proxyPool);
-			} catch (e) {
+			} catch {
 				return new Response(
 					JSON.stringify({
 						type: "error",
 						error: { message: "Invalid JSON body", type: "invalid_request_error" },
 					}),
-					{ status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+					{ status: 400, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
 				);
 			}
 		}
@@ -551,22 +526,19 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 					status: 200,
 					headers: {
 						"Content-Type": "application/json",
-						"Access-Control-Allow-Origin": "*",
+						...getCorsHeaders(),
 					},
 				},
 			);
 		}
 
-		// WebSocket upgrade check — if the target is ws:// or wss://,
-		// attempt to upgrade and relay.  This must happen before the
-		// general HTTP relay.
+		// WebSocket upgrade check
 		if (
 			req.method === "GET" &&
 			req.headers.get("upgrade")?.toLowerCase() === "websocket"
 		) {
 			const wsResult = handleWebSocketUpgrade(req, server);
 			if (wsResult === undefined) {
-				// Upgrade was handled by Bun — return undefined
 				return undefined;
 			}
 			return wsResult;
@@ -588,11 +560,10 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 				targetUrl: target,
 			});
 
-			// Connect to the upstream WebSocket
 			const upstream = new WebSocket(target);
 
 			upstream.onopen = () => {
-				// Connection established — ready for bidirectional relay
+				// Connection established
 			};
 
 			upstream.onmessage = (event: MessageEvent) => {
@@ -618,7 +589,6 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 				ws.close(event.code || 1000, event.reason || "Upstream closed");
 			};
 
-			// Store the upstream so we can close it on client disconnect
 			ws.data.upstream = upstream;
 		},
 
@@ -645,21 +615,28 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 		},
 
 		drain(_ws: ServerWebSocket<WSRelayData>) {
-			// Backpressure not implemented in this minimal relay
+			// Backpressure not implemented
 		},
 	},
 });
 
-// ─── Startup ───────────────────────────────────────────────────────────────────
+// --- Startup -----------------------------------------------------------------
 
 console.log(
 	`[relay] Edge Proxy Relay v${RELAY_VERSION} listening on http://localhost:${server.port}`,
 );
+if (isDevMode()) {
+	console.log("[relay] Development mode: HMR enabled");
+}
 
-// ─── Graceful Shutdown ─────────────────────────────────────────────────────────
+// --- Graceful Shutdown -------------------------------------------------------
 
 const shutdownHandler = (signal: string) => {
 	console.log(`\n[relay] Received ${signal}, shutting down gracefully...`);
+
+	// Close active SSE streams so clients get proper stream end events
+	closeAllActiveReaders();
+
 	server.stop();
 	process.exit(0);
 };
@@ -667,7 +644,7 @@ const shutdownHandler = (signal: string) => {
 process.on("SIGTERM", () => shutdownHandler("SIGTERM"));
 process.on("SIGINT", () => shutdownHandler("SIGINT"));
 
-// ─── Exports (for testing) ─────────────────────────────────────────────────────
+// --- Exports (for testing) ---------------------------------------------------
 
 export type { WSRelayData };
 export {

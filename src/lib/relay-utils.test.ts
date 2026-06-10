@@ -652,7 +652,7 @@ describe("classifyFetchError", () => {
 		const result = classifyFetchError(error);
 		expect(result.code).toBe("NETWORK_ERROR");
 		expect(result.status).toBe(502);
-		expect(result.message).toBe("Unknown upstream error");
+		expect(result.message).toBe("Upstream unreachable");
 	});
 
 	test("should handle non-Error thrown values", () => {

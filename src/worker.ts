@@ -7,8 +7,7 @@
  * Reuses the same relay logic from `src/lib/` and `src/middleware/` as
  * the standalone Bun.serve() server, but:
  *   - Uses `env` for configuration (Workers don't have process.env)
- *   - Does NOT support WebSocket upgrades (Workers can proxy WS but
- *     this handler only handles HTTP relay)
+ *   - Does NOT support WebSocket upgrades
  *   - Rate limiter is per-isolate (resets on cold start)
  */
 
@@ -21,6 +20,7 @@ import {
 	classifyFetchError,
 	createErrorResponse,
 	createCorsPreflightResponse,
+	getCorsHeaders,
 } from "./lib/relay-utils";
 
 import { checkBodySize } from "./middleware/body-limiter";
@@ -29,7 +29,7 @@ import { logRelayEvent } from "./middleware/logger";
 import { handleChatCompletion, listModels } from "./lib/ai-proxy";
 import { handleAnthropicMessages } from "./lib/anthropic-proxy";
 
-// ─── Types ───────────────────────────────────────────────────────────────────────
+// --- Types -------------------------------------------------------------------
 
 export interface Env {
 	/** Upstream fetch timeout in ms (default: 30000) */
@@ -44,7 +44,21 @@ export interface Env {
 	API_KEY?: string;
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────────
+// --- Singletons (per-isolate, survives warm starts) ---------------------------
+
+let rateLimiter: ReturnType<typeof createRateLimiter> | null = null;
+
+function getRateLimiter(env: Env) {
+	if (!rateLimiter) {
+		rateLimiter = createRateLimiter({
+			maxRequests: getNumericEnv(env, "RATE_LIMIT_MAX", 100),
+			windowMs: getNumericEnv(env, "RATE_LIMIT_WINDOW_MS", 60000),
+		});
+	}
+	return rateLimiter;
+}
+
+// --- Helpers ------------------------------------------------------------------
 
 function getNumericEnv(
 	env: Env,
@@ -68,19 +82,20 @@ function getClientIP(req: Request): string {
 	return "unknown";
 }
 
-// ─── Auth Helper ─────────────────────────────────────────────────────────────────
+// --- Auth Helper ---------------------------------------------------------------
 
 function requireAuth(req: Request): Response | null {
+	const apiKey = process.env.API_KEY ?? "sk-dummy-key";
 	const header = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? "";
 	const key = header.replace(/^Bearer\s+/i, "").trim();
-	if (key === "sk-dummy-key") return null;
+	if (key === apiKey) return null;
 	return new Response(
 		JSON.stringify({ error: { message: "Unauthorized", type: "auth_error" } }),
-		{ status: 401, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+		{ status: 401, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
 	);
 }
 
-// ─── Route Handlers ──────────────────────────────────────────────────────────────
+// --- Route Handlers ------------------------------------------------------------
 
 const SERVER_START_TIME = Date.now();
 const RELAY_VERSION = "1.0.0";
@@ -96,7 +111,7 @@ function handleHealth(): Response {
 			status: 200,
 			headers: {
 				"Content-Type": "application/json",
-				"Access-Control-Allow-Origin": "*",
+				...getCorsHeaders(),
 			},
 		},
 	);
@@ -183,7 +198,7 @@ function handleDocs(): Response {
 		status: 200,
 		headers: {
 			"Content-Type": "text/html; charset=utf-8",
-			"Access-Control-Allow-Origin": "*",
+			...getCorsHeaders(),
 		},
 	});
 }
@@ -222,7 +237,7 @@ function handleIndex(): Response {
 	});
 }
 
-// ─── Relay Logic ─────────────────────────────────────────────────────────────────
+// --- Relay Logic ---------------------------------------------------------------
 
 async function handleRelay(req: Request, env: Env): Promise<Response> {
 	const startTime = performance.now();
@@ -232,18 +247,14 @@ async function handleRelay(req: Request, env: Env): Promise<Response> {
 
 	const RELAY_TIMEOUT_MS = getNumericEnv(env, "RELAY_TIMEOUT_MS", 30000);
 
-	// Per-isolate rate limiter (recreated on each cold start)
-	const rateLimiter = createRateLimiter({
-		maxRequests: getNumericEnv(env, "RATE_LIMIT_MAX", 100),
-		windowMs: getNumericEnv(env, "RATE_LIMIT_WINDOW_MS", 60000),
-	});
+	const limiter = getRateLimiter(env);
 
-	// ── Pre-flight CORS ──────────────────────────────────────────────
+	// -- Pre-flight CORS --------------------------------------------------------
 	if (method === "OPTIONS") {
 		return createCorsPreflightResponse();
 	}
 
-	// ── Middleware: Body size check ──────────────────────────────────
+	// -- Middleware: Body size check -------------------------------------------
 	const bodyError = checkBodySize(req);
 	if (bodyError) {
 		logRelayEvent({
@@ -256,8 +267,8 @@ async function handleRelay(req: Request, env: Env): Promise<Response> {
 		return bodyError;
 	}
 
-	// ── Middleware: Rate limiting ────────────────────────────────────
-	const rateCheck = rateLimiter.check(clientIP);
+	// -- Middleware: Rate limiting ---------------------------------------------
+	const rateCheck = limiter.check(clientIP);
 	if (!rateCheck.allowed) {
 		logRelayEvent({
 			method,
@@ -278,7 +289,7 @@ async function handleRelay(req: Request, env: Env): Promise<Response> {
 				status: 429,
 				headers: {
 					"Content-Type": "application/json",
-					"Access-Control-Allow-Origin": "*",
+					...getCorsHeaders(),
 					"Retry-After": String(
 						Math.ceil((rateCheck.retryAfterMs ?? 60_000) / 1000),
 					),
@@ -287,11 +298,11 @@ async function handleRelay(req: Request, env: Env): Promise<Response> {
 		);
 	}
 
-	// ── Extract relay parameters from headers ───────────────────────
+	// -- Extract relay parameters from headers ---------------------------------
 	const target = req.headers.get("x-relay-target");
 	const relayPath = req.headers.get("x-relay-path") ?? "/";
 
-	// ── SSRF: Normalize and validate target URL ─────────────────────
+	// -- SSRF: Normalize and validate target URL --------------------------------
 	const targetUrl = normalizeTargetUrl(target, relayPath);
 	if (!targetUrl) {
 		logRelayEvent({
@@ -325,7 +336,7 @@ async function handleRelay(req: Request, env: Env): Promise<Response> {
 		});
 	}
 
-	// ── Build the upstream request ──────────────────────────────────
+	// -- Build the upstream request ---------------------------------------------
 	const filteredHeaders = filterRequestHeaders(req.headers);
 	const fetchOptions = buildRelayRequest(
 		req,
@@ -335,7 +346,7 @@ async function handleRelay(req: Request, env: Env): Promise<Response> {
 
 	const targetUrlString = targetUrl.toString();
 
-	// ── Execute upstream fetch ──────────────────────────────────────
+	// -- Execute upstream fetch -------------------------------------------------
 	let response: Response;
 	try {
 		response = await fetch(targetUrlString, fetchOptions);
@@ -353,7 +364,7 @@ async function handleRelay(req: Request, env: Env): Promise<Response> {
 		return createErrorResponse(classified);
 	}
 
-	// ── Build relay response ────────────────────────────────────────
+	// -- Build relay response ---------------------------------------------------
 	const relayedResponse = createRelayResponse(response);
 
 	logRelayEvent({
@@ -368,13 +379,12 @@ async function handleRelay(req: Request, env: Env): Promise<Response> {
 	return relayedResponse;
 }
 
-// ─── Exported Worker Handler ─────────────────────────────────────────────────────
+// --- Exported Worker Handler ---------------------------------------------------
 
 export default {
 	async fetch(req: Request, env: Env): Promise<Response> {
 		const url = new URL(req.url);
 
-		// Static routes — show index only when no relay target is requested
 		if (url.pathname === "/health") return handleHealth();
 		if (url.pathname === "/docs") return handleDocs();
 		if (
@@ -385,7 +395,6 @@ export default {
 			return handleIndex();
 		}
 
-		// WebSocket upgrade — not fully supported in this handler
 		if (
 			req.method === "GET" &&
 			req.headers.get("upgrade")?.toLowerCase() === "websocket"
@@ -400,13 +409,12 @@ export default {
 					status: 400,
 					headers: {
 						"Content-Type": "application/json",
-						"Access-Control-Allow-Origin": "*",
+						...getCorsHeaders(),
 					},
 				},
 			);
 		}
 
-		// AI proxy routes — OpenAI-compatible
 		if (url.pathname === "/v1/chat/completions") {
 			if (req.method === "OPTIONS") return createCorsPreflightResponse();
 			if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
@@ -418,12 +426,11 @@ export default {
 			} catch {
 				return new Response(
 					JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }),
-					{ status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+					{ status: 400, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
 				);
 			}
 		}
 
-		// AI proxy routes — Anthropic-compatible
 		if (url.pathname === "/v1/messages") {
 			if (req.method === "OPTIONS") return createCorsPreflightResponse();
 			if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
@@ -435,12 +442,11 @@ export default {
 			} catch {
 				return new Response(
 					JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }),
-					{ status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+					{ status: 400, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
 				);
 			}
 		}
 
-		// Models list
 		if (url.pathname === "/v1/models" && req.method === "GET") {
 			const authErr = requireAuth(req);
 			if (authErr) return authErr;
@@ -452,11 +458,10 @@ export default {
 			}));
 			return new Response(
 				JSON.stringify({ object: "list", data: models }),
-				{ status: 200, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+				{ status: 200, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
 			);
 		}
 
-		// Generic HTTP relay
 		return handleRelay(req, env);
 	},
 };

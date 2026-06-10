@@ -12,6 +12,9 @@
 
 import type { ProxyPool } from "./proxy-pool";
 import { MODEL_ROUTES, type BackendConfig } from "./ai-proxy";
+import { fetchWithRetry } from "./fetch-utils";
+import { SSELineBuffer } from "./fetch-utils";
+import { isDevMode } from "./fetch-utils";
 
 // --- Types -------------------------------------------------------------------
 
@@ -40,7 +43,7 @@ interface AnthropicResponse {
 	usage: { input_tokens: number; output_tokens: number };
 }
 
-// --- Model resolution ---------------------------------------------------------
+// --- Model resolution ----------------------------------------------------------
 
 /** Resolve a model name to a backend config (uses MODEL_ROUTES directly). */
 function resolveAnthropicModel(
@@ -108,7 +111,6 @@ function anthropicToBackend(
 				: anthReq.stop_sequences;
 	}
 
-	// If backend has a custom adaptRequest, use it
 	if (config.adaptRequest) {
 		return config.adaptRequest({
 			model: backendModel,
@@ -123,7 +125,7 @@ function anthropicToBackend(
 	return base;
 }
 
-// --- Translation: Backend -> Anthropic ----------------------------------------
+// --- Translation: Backend -> Anthropic -----------------------------------------
 
 /**
  * Convert a backend JSON response body into Anthropic Messages format.
@@ -150,7 +152,7 @@ function backendToAnthropicResponse(
 	};
 }
 
-// --- Streaming: Backend SSE -> Anthropic SSE ---------------------------------
+// --- Streaming: Backend SSE -> Anthropic SSE -----------------------------------
 
 /**
  * Accumulate text from an SSE response body (data: lines) into a single string.
@@ -186,7 +188,6 @@ function accumulateSSEText(sseBody: string): string {
 function extractTextFromSSE(parsed: any): string | null {
 	if (parsed == null) return null;
 
-	// Claude Code / Anthropic SSE: type-based events
 	if (typeof parsed === "object") {
 		switch (parsed.type) {
 			case "text-delta":
@@ -196,12 +197,10 @@ function extractTextFromSSE(parsed: any): string | null {
 		}
 	}
 
-	// OpenAI format: choices[0].delta.content
 	const openai = parsed.choices?.[0]?.delta?.content ??
 		parsed.choices?.[0]?.text;
 	if (openai) return openai;
 
-	// Generic fallbacks
 	if (typeof parsed.content === "string") return parsed.content;
 	if (typeof parsed.text === "string") return parsed.text;
 	if (typeof parsed.delta === "string") return parsed.delta;
@@ -211,8 +210,6 @@ function extractTextFromSSE(parsed: any): string | null {
 
 /**
  * Transform a backend SSE line into Anthropic SSE content_block_delta events.
- *
- * Returns the SSE event string, or null to skip the line.
  */
 function backendLineToAnthropicSSE(
 	line: string,
@@ -221,14 +218,12 @@ function backendLineToAnthropicSSE(
 ): string | null {
 	if (!line || line.trim().length === 0) return null;
 
-	// Use the backend's adaptStreamLine if available (for custom backends)
 	if (config.adaptStreamLine) {
 		const adapted = config.adaptStreamLine(line, {} as any);
 		if (!adapted) return null;
 		if (adapted === "data: [DONE]") {
-			return null; // let the stream transformer handle DONE
+			return null;
 		}
-		// Parse the adapted line
 		try {
 			const parsed = JSON.parse(adapted.replace(/^data: /, ""));
 			const text = extractTextFromSSE(parsed);
@@ -239,15 +234,13 @@ function backendLineToAnthropicSSE(
 		}
 	}
 
-	// All data: lines -- try to parse as JSON in any format
 	if (line.startsWith("data: ")) {
 		const raw = line.slice(6);
 		if (raw === "[DONE]") {
-			return null; // let the stream transformer handle DONE
+			return null;
 		}
 		try {
 			const parsed = JSON.parse(raw);
-			// Skip lifecycle/non-content events
 			if (parsed.type === "start" || parsed.type === "start-step" ||
 				parsed.type === "data-thinking-step" || parsed.type === "text-start" ||
 				parsed.type === "ping") {
@@ -261,7 +254,6 @@ function backendLineToAnthropicSSE(
 		}
 	}
 
-	// Plain text chunks (or non-data lines)
 	if (line.length > 0) {
 		return formatContentBlockDelta(line);
 	}
@@ -278,7 +270,7 @@ function formatContentBlockDelta(text: string): string {
 	})}`;
 }
 
-// --- Stream transformer -------------------------------------------------------
+// --- Stream transformer --------------------------------------------------------
 
 function transformAnthropicStream(
 	body: ReadableStream,
@@ -288,20 +280,18 @@ function transformAnthropicStream(
 	const reader = body.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
+	const lineBuffer = new SSELineBuffer();
 
-	// State machine for Anthropic SSE protocol
 	let phase: "init" | "block" | "done" = "init";
 	let messageId = `msg_${Date.now()}`;
 
 	return new ReadableStream({
 		async pull(controller) {
 			try {
-				// --- Phase: emit message_start + content_block_start ------------
 				if (phase === "init") {
 					phase = "block";
 					messageId = `msg_${Date.now()}`;
 
-					// message_start
 					const startEvent = `event: message_start\ndata: ${JSON.stringify({
 						type: "message_start",
 						message: {
@@ -317,7 +307,6 @@ function transformAnthropicStream(
 					})}`;
 					controller.enqueue(encoder.encode(startEvent + "\n\n"));
 
-					// content_block_start -- must precede any deltas
 					const blockStart = `event: content_block_start\ndata: ${JSON.stringify({
 						type: "content_block_start",
 						index: 0,
@@ -326,16 +315,22 @@ function transformAnthropicStream(
 					controller.enqueue(encoder.encode(blockStart + "\n\n"));
 				}
 
-				// --- Phase: read stream and emit content_block_delta events -----
 				while (phase === "block") {
 					const { done, value } = await reader.read();
 					if (done) {
+						const remaining = lineBuffer.flush();
+						if (remaining.length > 0) {
+							const adapted = backendLineToAnthropicSSE(remaining, model, config);
+							if (adapted) {
+								controller.enqueue(encoder.encode(adapted + "\n\n"));
+							}
+						}
 						phase = "done";
 						break;
 					}
 
 					const chunk = decoder.decode(value, { stream: true });
-					const lines = chunk.split("\n");
+					const lines = lineBuffer.add(chunk);
 
 					for (const line of lines) {
 						const adapted = backendLineToAnthropicSSE(line, model, config);
@@ -344,22 +339,18 @@ function transformAnthropicStream(
 						}
 					}
 
-					// Yield control so we don't block -- let next pull() continue
 					return;
 				}
 
-				// --- Phase: emit closing events (content_block_stop, message_delta, message_stop) -
 				if (phase === "done") {
-					phase = "done"; // prevent re-entry
+					phase = "done";
 
-					// content_block_stop
 					controller.enqueue(
 						encoder.encode(
 							'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
 						),
 					);
 
-					// message_delta -- required before message_stop
 					controller.enqueue(
 						encoder.encode(
 							`event: message_delta\ndata: ${JSON.stringify({
@@ -370,7 +361,6 @@ function transformAnthropicStream(
 						),
 					);
 
-					// message_stop
 					controller.enqueue(
 						encoder.encode(
 							'event: message_stop\ndata: {"type":"message_stop"}\n\n',
@@ -380,68 +370,104 @@ function transformAnthropicStream(
 					controller.close();
 				}
 			} catch (err) {
-				controller.enqueue(
-					encoder.encode(
-						`event: error\ndata: ${JSON.stringify({ error: String(err) })}\n\n`,
-					),
-				);
+				if (isDevMode()) {
+					controller.enqueue(
+						encoder.encode(
+							`event: error\ndata: ${JSON.stringify({ error: String(err) })}\n\n`,
+						),
+					);
+				} else {
+					controller.enqueue(
+						encoder.encode(
+							'event: error\ndata: {"error":"Stream error"}\n\n',
+						),
+					);
+				}
 				controller.close();
 			}
 		},
 	});
 }
 
-// --- Main handler -------------------------------------------------------------
+// --- Input validation ----------------------------------------------------------
+
+interface ValidationError {
+	message: string;
+	type: string;
+}
+
+function validateAnthropicRequest(body: unknown): ValidationError | null {
+	const req = body as Record<string, unknown>;
+
+	if (!req.model || typeof req.model !== "string") {
+		return { message: "model is required", type: "invalid_request_error" };
+	}
+
+	if (!req.max_tokens || typeof req.max_tokens !== "number") {
+		return { message: "max_tokens is required", type: "invalid_request_error" };
+	}
+
+	if (!Array.isArray(req.messages) || req.messages.length === 0) {
+		return { message: "messages must be a non-empty array", type: "invalid_request_error" };
+	}
+
+	for (let i = 0; i < req.messages.length; i++) {
+		const msg = req.messages[i] as Record<string, unknown> | undefined;
+		if (!msg || typeof msg !== "object") {
+			return { message: `messages[${i}] must be an object`, type: "invalid_request_error" };
+		}
+		if (!msg.role || typeof msg.role !== "string") {
+			return { message: `messages[${i}].role is required`, type: "invalid_request_error" };
+		}
+		if (msg.content == null) {
+			return { message: `messages[${i}].content is required`, type: "invalid_request_error" };
+		}
+	}
+
+	return null;
+}
+
+// --- Standardized error helper -------------------------------------------------
+
+function anthropicError(status: number, message: string, type: string): Response {
+	return new Response(
+		JSON.stringify({
+			type: "error",
+			error: { message, type },
+		}),
+		{
+			status,
+			headers: {
+				"Content-Type": "application/json",
+				"Access-Control-Allow-Origin": "*",
+			},
+		},
+	);
+}
+
+// --- Main handler --------------------------------------------------------------
 
 /**
  * Handle an Anthropic-compatible messages request.
- *
- * @param body  Parsed JSON body (Anthropic Messages format)
- * @param proxyPool  Optional proxy pool for fallback on failure
  */
 export async function handleAnthropicMessages(
 	body: unknown,
 	proxyPool?: ProxyPool,
 ): Promise<Response> {
+	// -- Input validation -------------------------------------------------------
+	const validationError = validateAnthropicRequest(body);
+	if (validationError) {
+		return anthropicError(400, validationError.message, validationError.type);
+	}
+
 	const req = body as AnthropicRequest;
-
-	if (!req.model) {
-		return new Response(
-			JSON.stringify({
-				type: "error",
-				error: { message: "model is required", type: "invalid_request_error" },
-			}),
-			{ status: 400, headers: { "Content-Type": "application/json" } },
-		);
-	}
-
-	if (!req.max_tokens) {
-		return new Response(
-			JSON.stringify({
-				type: "error",
-				error: { message: "max_tokens is required", type: "invalid_request_error" },
-			}),
-			{ status: 400, headers: { "Content-Type": "application/json" } },
-		);
-	}
 
 	const resolved = resolveAnthropicModel(req.model);
 	if (!resolved) {
-		return new Response(
-			JSON.stringify({
-				type: "error",
-				error: {
-					message: `Unknown model: ${req.model}. Available: ${listAnthropicModels().join(", ")}`,
-					type: "invalid_request_error",
-				},
-			}),
-			{
-				status: 400,
-				headers: {
-					"Content-Type": "application/json",
-					"Access-Control-Allow-Origin": "*",
-				},
-			},
+		return anthropicError(
+			400,
+			`Unknown model: ${req.model}. Available: ${listAnthropicModels().join(", ")}`,
+			"invalid_request_error",
 		);
 	}
 
@@ -457,71 +483,43 @@ export async function handleAnthropicMessages(
 
 	const url = config.url;
 
-	// ---- Execute (direct -> proxy fallback) --------------------------------
-	let response: Response | undefined;
+	// -- Execute (direct -> proxy fallback) with shared retry -------------------
+	const result = await fetchWithRetry(
+		url,
+		init,
+		proxyPool,
+		`anthropic:${req.model}`,
+	);
 
-	for (let attempt = 0; attempt < 3; attempt++) {
-		if (attempt === 0) {
-			init.proxy = undefined; // direct
-		} else if (attempt === 1 && proxyPool && proxyPool.size > 0) {
-			init.proxy = proxyPool.getProxyUrl()!;
-		} else if (attempt >= 2 && proxyPool && proxyPool.size > 0) {
-			const next = proxyPool.rotate();
-			if (!next) break;
-			init.proxy = proxyPool.getProxyUrl()!;
-		} else {
-			break;
-		}
-
-		try {
-			response = await fetch(url, init);
-			if (response.ok) {
-				// Success -- reset proxy failure if we used one
-				if (proxyPool && proxyPool.size > 0 && init.proxy && attempt > 0) {
-					proxyPool.markSuccess();
-				}
-				break;
-			}
-			// Non-2xx -- mark proxy as failed so next attempt rotates
-			if (proxyPool && proxyPool.size > 0 && init.proxy) {
-				proxyPool.markFailed();
-			}
-		} catch {
-			// Network error -- mark proxy as failed, retry
-			if (proxyPool && proxyPool.size > 0 && init.proxy) {
-				proxyPool.markFailed();
-			}
-		}
-	}
-
-	if (!response) {
-		return new Response(
-			JSON.stringify({
-				type: "error",
-				error: { message: "Upstream service unreachable after retries", type: "server_error" },
-			}),
-			{ status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
-		);
-	}
-
-	if (!response.ok) {
-		const errBody = await response.text().catch(() => "");
+	if (result.errorClassification) {
 		return new Response(
 			JSON.stringify({
 				type: "error",
 				error: {
-					message: `Upstream error ${response.status}: ${errBody.slice(0, 500)}`,
-					type: "upstream_error",
+					message: result.errorClassification.message,
+					type: "server_error",
 				},
 			}),
 			{
-				status: response.status,
-				headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+				status: result.errorClassification.status,
+				headers: {
+					"Content-Type": "application/json",
+					"Access-Control-Allow-Origin": "*",
+				},
 			},
 		);
 	}
 
-	// ---- Handle streaming -------------------------------------------------
+	const response = result.response!;
+
+	// -- Handle error responses from backend ------------------------------------
+	if (!response.ok) {
+		const status = response.status;
+		const genericMsg = status >= 500 ? "Upstream server error" : "Upstream rejected request";
+		return anthropicError(status, genericMsg, "upstream_error");
+	}
+
+	// -- Handle streaming -------------------------------------------------------
 	if (wantsStream) {
 		const transformed = transformAnthropicStream(
 			response.body!,
@@ -540,11 +538,9 @@ export async function handleAnthropicMessages(
 		});
 	}
 
-	// ---- Handle non-streaming ---------------------------------------------
+	// -- Handle non-streaming ---------------------------------------------------
 	const text = await response.text();
 
-	// Backend may return SSE (data: lines) even for non-streaming requests.
-	// Accumulate all text-delta events to reconstruct the response body.
 	if (text.trimStart().startsWith("data: ")) {
 		const accumulated = accumulateSSEText(text);
 		if (accumulated) {

@@ -3,8 +3,9 @@
  *
  * Checks the Content-Length header against a configurable maximum.
  * Returns a 413 Payload Too Large response when the body exceeds the limit.
- * Requests without a Content-Length header are passed through since
- * the body size cannot be determined upfront with streaming.
+ *
+ * For streaming requests (no Content-Length), a TransformStream-based
+ * enforcer is available that counts bytes and aborts when the limit is exceeded.
  */
 
 const DEFAULT_MAX_BODY_SIZE = 1_048_576; // 1 MB
@@ -19,16 +20,16 @@ let maxBodySize = DEFAULT_MAX_BODY_SIZE;
  * cannot be determined (no Content-Length header).
  */
 export function checkBodySize(request: Request): Response | null {
-	const contentType = request.headers.get("content-length");
-	if (contentType === null) {
-		// Cannot determine size upfront — pass through (streaming body).
+	const header = request.headers.get("content-length");
+	if (header === null) {
+		// Cannot determine size upfront -- pass through (streaming body).
 		return null;
 	}
 
-	const contentLength = Number.parseInt(contentType, 10);
+	const contentLength = Number.parseInt(header, 10);
 
 	if (Number.isNaN(contentLength) || contentLength < 0) {
-		// Malformed Content-Length — pass through and let the server handle it.
+		// Malformed Content-Length -- pass through and let the server handle it.
 		return null;
 	}
 
@@ -49,6 +50,45 @@ export function checkBodySize(request: Request): Response | null {
 	}
 
 	return null;
+}
+
+/**
+ * Wrap a ReadableStream so it enforces a byte limit on the total data
+ * read.  If the limit is exceeded the stream errors with a `BodyTooLarge`
+ * error and enqueues a 413-style JSON error object.
+ *
+ * This catches oversized streaming bodies that have no `Content-Length`
+ * header and would otherwise bypass the Content-Length check.
+ */
+export function createStreamBodyLimiter(
+	stream: ReadableStream<Uint8Array>,
+): ReadableStream<Uint8Array> {
+	let totalBytes = 0;
+
+	const transformer = new TransformStream<Uint8Array, Uint8Array>({
+		transform(chunk, controller) {
+			totalBytes += chunk.byteLength;
+			if (totalBytes > maxBodySize) {
+				const errBody = JSON.stringify({
+					error: "Payload Too Large",
+					message: `Streaming body exceeded maximum allowed size of ${maxBodySize} bytes`,
+					maxSizeBytes: maxBodySize,
+				});
+				controller.enqueue(
+					new TextEncoder().encode(
+						`data: ${errBody}\n\nevent: error\ndata: {}\n\n`,
+					),
+				);
+				controller.error(
+					new Error(`Body exceeded ${maxBodySize} byte limit`),
+				);
+				return;
+			}
+			controller.enqueue(chunk);
+		},
+	});
+
+	return stream.pipeThrough(transformer);
 }
 
 /**

@@ -13,8 +13,11 @@
  */
 
 import type { ProxyPool } from "./proxy-pool";
+import { fetchWithRetry } from "./fetch-utils";
+import { SSELineBuffer } from "./fetch-utils";
+import { isDevMode } from "./fetch-utils";
 
-// ─── Types ───────────────────────────────────────────────────────────────────────
+// --- Types -------------------------------------------------------------------
 
 export interface OpenAIRequest {
 	model: string;
@@ -44,11 +47,11 @@ export interface BackendConfig {
 	adaptStreamLine?: (line: string, req: OpenAIRequest) => string | null;
 }
 
-// ─── Model routing table ─────────────────────────────────────────────────────────
+// --- Model routing table -------------------------------------------------------
 
-/** Map of model name → backend configuration. Exported for reuse by anthropic-proxy. */
+/** Map of model name -> backend configuration. */
 export const MODEL_ROUTES: Record<string, BackendConfig> = {
-	// ── opencode.ai (OpenAI-compatible — passthrough) ────────────────
+	// -- opencode.ai (OpenAI-compatible -- passthrough) --------------------------
 	"deepseek-v4-flash-free": {
 		provider: "opencode",
 		url: "https://opencode.ai/zen/v1/chat/completions",
@@ -57,7 +60,7 @@ export const MODEL_ROUTES: Record<string, BackendConfig> = {
 		},
 	},
 
-	// ── surfsense.com (custom format) ───────────────────────────────
+	// -- surfsense.com (custom format) -------------------------------------------
 	"gpt-5.4-mini-no-login": {
 		provider: "surfsense",
 		url: "https://api.surfsense.com/api/v1/public/anon-chat/stream",
@@ -119,7 +122,7 @@ export const MODEL_ROUTES: Record<string, BackendConfig> = {
 		}),
 	},
 
-	// ── deep-seek.ai (custom format) ────────────────────────────────
+	// -- deep-seek.ai (custom format) --------------------------------------------
 	"deepseek/deepseek-v4-flash": {
 		provider: "deepseek",
 		url: "https://deep-seek.ai/api/chat",
@@ -133,11 +136,8 @@ export const MODEL_ROUTES: Record<string, BackendConfig> = {
 				"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
 		},
 		adaptStreamLine: (line) => {
-			// deep-seek.ai may return plain text chunks or SSE-like data
 			if (!line || line.trim().length === 0) return null;
-			// If it's already SSE format, try to pass through
 			if (line.startsWith("data: ")) {
-				// Rewrite the id and object fields
 				try {
 					const parsed = JSON.parse(line.slice(6));
 					parsed.id = `chatcmpl-${Date.now()}`;
@@ -149,7 +149,6 @@ export const MODEL_ROUTES: Record<string, BackendConfig> = {
 					return line;
 				}
 			}
-			// Plain text chunks — wrap in OpenAI SSE format
 			return `data: ${JSON.stringify({
 				id: `chatcmpl-${Date.now()}`,
 				object: "chat.completion.chunk",
@@ -184,7 +183,7 @@ export const MODEL_ROUTES: Record<string, BackendConfig> = {
 	},
 };
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────────
+// --- Helpers ------------------------------------------------------------------
 
 /** List all available model names. */
 export function listModels(): string[] {
@@ -196,7 +195,7 @@ export function resolveModel(model: string): BackendConfig | undefined {
 	return MODEL_ROUTES[model];
 }
 
-// ─── Request building ────────────────────────────────────────────────────────────
+// --- Request building ----------------------------------------------------------
 
 /**
  * Build the backend `fetch()` options from an OpenAI-style request.
@@ -204,7 +203,6 @@ export function resolveModel(model: string): BackendConfig | undefined {
 function buildBackendRequest(
 	req: OpenAIRequest,
 	config: BackendConfig,
-	proxyPool?: ProxyPool,
 ): { url: string; init: RequestInit & { proxy?: string } } {
 	const body =
 		config.adaptRequest?.(req) ?? {
@@ -223,15 +221,10 @@ function buildBackendRequest(
 		body: JSON.stringify(body),
 	};
 
-	// Direct first, proxy as fallback (if pool available)
-	if (proxyPool && proxyPool.size > 0) {
-		init.proxy = undefined; // start direct
-	}
-
 	return { url: config.url, init };
 }
 
-// ─── Response parsing ───────────────────────────────────────────────────────────
+// --- Response parsing ----------------------------------------------------------
 
 /**
  * Try to parse a JSON response into OpenAI format.
@@ -251,7 +244,7 @@ function parseJSONResponse(
 		}
 	}
 
-	// Default fallback — assume raw text is the content
+	// Default fallback -- assume raw text is the content
 	return {
 		id: `chatcmpl-${Date.now()}`,
 		object: "chat.completion",
@@ -268,38 +261,103 @@ function parseJSONResponse(
 	};
 }
 
-// ─── Main handler ───────────────────────────────────────────────────────────────
+// --- Input validation ---------------------------------------------------------
+
+interface ValidationError {
+	message: string;
+	type: string;
+}
+
+function validateChatRequest(body: unknown): ValidationError | null {
+	const req = body as Record<string, unknown>;
+
+	if (!req.model || typeof req.model !== "string") {
+		return { message: "model is required", type: "invalid_request_error" };
+	}
+
+	if (!Array.isArray(req.messages) || req.messages.length === 0) {
+		return { message: "messages must be a non-empty array", type: "invalid_request_error" };
+	}
+
+	for (let i = 0; i < req.messages.length; i++) {
+		const msg = req.messages[i] as Record<string, unknown> | undefined;
+		if (!msg || typeof msg !== "object") {
+			return { message: `messages[${i}] must be an object`, type: "invalid_request_error" };
+		}
+		if (!msg.role || typeof msg.role !== "string") {
+			return { message: `messages[${i}].role is required`, type: "invalid_request_error" };
+		}
+		if (msg.content == null) {
+			return { message: `messages[${i}].content is required`, type: "invalid_request_error" };
+		}
+	}
+
+	return null;
+}
+
+// --- Standardized error helper -------------------------------------------------
+
+/** Create a standardized OpenAI-style error response. */
+function openAIError(status: number, message: string, type: string): Response {
+	return new Response(
+		JSON.stringify({ error: { message, type } }),
+		{
+			status,
+			headers: {
+				"Content-Type": "application/json",
+				"Access-Control-Allow-Origin": "*",
+			},
+		},
+	);
+}
+
+// --- Main handler --------------------------------------------------------------
 
 /**
  * Handle an OpenAI-compatible chat completions request.
- *
- * @param body  Parsed JSON body (OpenAI format)
- * @param proxyPool  Optional proxy pool for fallback on failure
  */
 export async function handleChatCompletion(
 	body: unknown,
 	proxyPool?: ProxyPool,
 ): Promise<Response> {
-	const req = body as OpenAIRequest;
-
-	if (!req.model) {
-		return new Response(
-			JSON.stringify({ error: { message: "model is required", type: "invalid_request_error" } }),
-			{ status: 400, headers: { "Content-Type": "application/json" } },
-		);
+	// -- Input validation -------------------------------------------------------
+	const validationError = validateChatRequest(body);
+	if (validationError) {
+		return openAIError(400, validationError.message, validationError.type);
 	}
+
+	const req = body as OpenAIRequest;
 
 	const config = resolveModel(req.model);
 	if (!config) {
+		return openAIError(
+			400,
+			`Unknown model: ${req.model}. Available: ${listModels().join(", ")}`,
+			"invalid_request_error",
+		);
+	}
+
+	const wantsStream = req.stream === true;
+	const { url, init } = buildBackendRequest(req, config);
+
+	// -- Execute (direct -> proxy fallback) with shared retry -------------------
+	const result = await fetchWithRetry(
+		url,
+		init,
+		proxyPool,
+		`openai:${req.model}`,
+	);
+
+	if (result.errorClassification) {
 		return new Response(
 			JSON.stringify({
 				error: {
-					message: `Unknown model: ${req.model}. Available: ${listModels().join(", ")}`,
-					type: "invalid_request_error",
+					message: result.errorClassification.message,
+					type: "upstream_error",
 				},
 			}),
 			{
-				status: 400,
+				status: result.errorClassification.status,
 				headers: {
 					"Content-Type": "application/json",
 					"Access-Control-Allow-Origin": "*",
@@ -308,89 +366,30 @@ export async function handleChatCompletion(
 		);
 	}
 
-	const wantsStream = req.stream === true;
-	const { url, init } = buildBackendRequest(req, config, proxyPool);
+	const response = result.response!;
 
-	// ── Execute (direct → proxy fallback) ─────────────────────────
-	let response: Response | undefined;
-
-	for (let attempt = 0; attempt < 3; attempt++) {
-		if (attempt === 0) {
-			init.proxy = undefined; // direct
-		} else if (attempt === 1 && proxyPool && proxyPool.size > 0) {
-			init.proxy = proxyPool.getProxyUrl()!;
-		} else if (attempt >= 2 && proxyPool && proxyPool.size > 0) {
-			const next = proxyPool.rotate();
-			if (!next) break;
-			init.proxy = proxyPool.getProxyUrl()!;
-		} else {
-			break;
-		}
-
-		try {
-			response = await fetch(url, init);
-			if (response.ok) {
-				// Success — reset proxy failure if we used one
-				if (proxyPool && proxyPool.size > 0 && init.proxy && attempt > 0) {
-					proxyPool.markSuccess();
-				}
-				break;
-			}
-			// Non-2xx — mark proxy as failed so next attempt rotates
-			if (proxyPool && proxyPool.size > 0 && init.proxy) {
-				proxyPool.markFailed();
-			}
-		} catch {
-			// Network error — mark proxy as failed, retry
-			if (proxyPool && proxyPool.size > 0 && init.proxy) {
-				proxyPool.markFailed();
-			}
-		}
-	}
-
-	if (!response) {
-		return new Response(
-			JSON.stringify({
-				error: { message: "Upstream service unreachable after retries", type: "server_error" },
-			}),
-			{ status: 502, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
-		);
-	}
-
-	// ── Handle error responses from backend ───────────────────────
+	// -- Handle error responses from backend ------------------------------------
 	if (!response.ok) {
-		const errBody = await response.text().catch(() => "");
-		return new Response(
-			JSON.stringify({
-				error: {
-					message: `Upstream error ${response.status}: ${errBody.slice(0, 500)}`,
-					type: "upstream_error",
-				},
-			}),
-			{
-				status: response.status,
-				headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-			},
-		);
+		const status = response.status;
+		const genericMsg = status >= 500 ? "Upstream server error" : "Upstream rejected request";
+		return openAIError(status, genericMsg, "upstream_error");
 	}
 
-	// ── Handle streaming ─────────────────────────────────────────
+	// -- Handle streaming -------------------------------------------------------
 	if (wantsStream || isStreamableResponse(response)) {
 		const contentType = response.headers.get("content-type") ?? "";
 		const isNativeStream = contentType.includes("text/event-stream");
 
 		if (isNativeStream && config.provider === "opencode") {
 			// Passthrough for OpenAI-compatible SSE
-			return new Response(response.body, {
-				status: 200,
-				headers: {
-					"Content-Type": "text/event-stream",
-					"Cache-Control": "no-cache",
-					Connection: "keep-alive",
-					"Access-Control-Allow-Origin": "*",
-					"X-Accel-Buffering": "no",
-				},
-			});
+			const headers: Record<string, string> = {
+				"Content-Type": "text/event-stream",
+				"Cache-Control": "no-cache",
+				Connection: "keep-alive",
+				"Access-Control-Allow-Origin": "*",
+				"X-Accel-Buffering": "no",
+			};
+			return new Response(response.body, { status: 200, headers });
 		}
 
 		// Transform the stream
@@ -411,7 +410,7 @@ export async function handleChatCompletion(
 		});
 	}
 
-	// ── Handle non-streaming response ─────────────────────────────
+	// -- Handle non-streaming response ------------------------------------------
 	const text = await response.text();
 	const adapted = parseJSONResponse(text, config, req);
 
@@ -424,7 +423,7 @@ export async function handleChatCompletion(
 	});
 }
 
-// ─── Stream handling ────────────────────────────────────────────────────────────
+// --- Stream handling -----------------------------------------------------------
 
 function isStreamableResponse(res: Response): boolean {
 	const ct = res.headers.get("content-type") ?? "";
@@ -438,6 +437,7 @@ function isStreamableResponse(res: Response): boolean {
 /**
  * Transform a backend ReadableStream into OpenAI SSE format.
  * Uses the config's `adaptStreamLine` if available.
+ * Uses SSELineBuffer to handle lines split across chunk boundaries.
  */
 function transformStream(
 	body: ReadableStream,
@@ -447,6 +447,7 @@ function transformStream(
 	const reader = body.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
+	const lineBuffer = new SSELineBuffer();
 
 	return new ReadableStream({
 		async pull(controller) {
@@ -454,13 +455,25 @@ function transformStream(
 				while (true) {
 					const { done, value } = await reader.read();
 					if (done) {
+						// Flush remaining text after stream ends
+						const remaining = lineBuffer.flush();
+						if (remaining.length > 0) {
+							if (config.adaptStreamLine) {
+								const adapted = config.adaptStreamLine(remaining, req);
+								if (adapted) {
+									controller.enqueue(encoder.encode(adapted + "\n\n"));
+								}
+							} else {
+								controller.enqueue(encoder.encode(remaining + "\n\n"));
+							}
+						}
 						controller.enqueue(encoder.encode("data: [DONE]\n\n"));
 						controller.close();
 						return;
 					}
 
 					const chunk = decoder.decode(value, { stream: true });
-					const lines = chunk.split("\n");
+					const lines = lineBuffer.add(chunk);
 
 					for (const line of lines) {
 						if (config.adaptStreamLine) {
@@ -469,17 +482,24 @@ function transformStream(
 								controller.enqueue(encoder.encode(adapted + "\n\n"));
 							}
 						} else {
-							// Default passthrough
 							controller.enqueue(encoder.encode(line + "\n\n"));
 						}
 					}
 				}
 			} catch (err) {
-				controller.enqueue(
-					encoder.encode(
-						`data: ${JSON.stringify({ error: String(err) })}\n\n`,
-					),
-				);
+				if (isDevMode()) {
+					controller.enqueue(
+						encoder.encode(
+							`data: ${JSON.stringify({ error: String(err) })}\n\n`,
+						),
+					);
+				} else {
+					controller.enqueue(
+						encoder.encode(
+							`data: ${JSON.stringify({ error: "Stream error" })}\n\n`,
+						),
+					);
+				}
 				controller.close();
 			}
 		},

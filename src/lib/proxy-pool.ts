@@ -8,7 +8,7 @@
 
 import { readFileSync, existsSync } from "node:fs";
 
-// ─── Types ───────────────────────────────────────────────────────────────────────
+// --- Types -------------------------------------------------------------------
 
 export interface ProxyEntry {
 	host: string;
@@ -17,21 +17,21 @@ export interface ProxyEntry {
 	password: string;
 }
 
-// ─── ProxyPool ───────────────────────────────────────────────────────────────────
+// --- ProxyPool ---------------------------------------------------------------
 
 export class ProxyPool {
 	private proxies: ProxyEntry[] = [];
 	private currentIndex = 0;
 	private failureThreshold = 3;
-	/** host:port → consecutive failure count */
+	/** host:port -> consecutive failure count */
 	private failures = new Map<string, number>();
 
-	// ── Load ──────────────────────────────────────────────────────────
+	// -- Load --------------------------------------------------------------------
 
 	/**
 	 * Load proxies from a file at `filePath`.
 	 *
-	 * Expected format — one proxy per line:
+	 * Expected format -- one proxy per line:
 	 *   host:port:username:password
 	 *
 	 * Lines starting with `#` are ignored as comments.
@@ -79,7 +79,7 @@ export class ProxyPool {
 	}
 
 	/**
-	 * Convenience — load from a path or skip.
+	 * Convenience -- load from a path or skip.
 	 * Returns `true` if proxies were loaded.
 	 */
 	tryLoad(filePath?: string): boolean {
@@ -87,7 +87,7 @@ export class ProxyPool {
 		return this.proxies.length > 0;
 	}
 
-	// ── Access ────────────────────────────────────────────────────────
+	// -- Access ------------------------------------------------------------------
 
 	/** Total number of proxies in the pool. */
 	get size(): number {
@@ -123,7 +123,7 @@ export class ProxyPool {
 		return `http://${auth}${entry.host}:${entry.port}`;
 	}
 
-	// ── Rotation ──────────────────────────────────────────────────────
+	// -- Rotation ----------------------------------------------------------------
 
 	/**
 	 * Advance to the next proxy (round-robin, wraps around).
@@ -136,15 +136,16 @@ export class ProxyPool {
 	}
 
 	/**
-	 * Mark the **current** proxy as failed.
+	 * Mark the **current** proxy as failed.  Increments the failure count;
+	 * when the count reaches the threshold a warning is logged.
 	 *
-	 * If the failure count exceeds `threshold`, the proxy is skipped and
-	 * rotation continues until a healthy proxy is found (or we've tried
-	 * all of them).
+	 * NOTE: This no longer calls `rotate()` automatically -- the caller is
+	 * responsible for deciding when to rotate.  Previously this was conflated
+	 * and caused double-rotation bugs in retry loops.
 	 */
-	markFailed(threshold?: number): ProxyEntry | null {
+	markFailed(threshold?: number): void {
 		const entry = this.getCurrent();
-		if (!entry) return null;
+		if (!entry) return;
 
 		const key = `${entry.host}:${entry.port}`;
 		const count = (this.failures.get(key) ?? 0) + 1;
@@ -153,11 +154,17 @@ export class ProxyPool {
 		const th = threshold ?? this.failureThreshold;
 		if (count >= th) {
 			console.warn(
-				`[proxy-pool] Proxy ${key} failed ${count}/${th} times — skipping`,
+				`[proxy-pool] Proxy ${key} failed ${count}/${th} times -- skipping`,
 			);
 		}
+	}
 
-		return this.rotate();
+	/** Check if the current proxy has exceeded the failure threshold. */
+	isFailed(threshold?: number): boolean {
+		const entry = this.getCurrent();
+		if (!entry) return true;
+		const key = `${entry.host}:${entry.port}`;
+		return (this.failures.get(key) ?? 0) >= (threshold ?? this.failureThreshold);
 	}
 
 	/** Reset the failure counter for the current proxy. */
