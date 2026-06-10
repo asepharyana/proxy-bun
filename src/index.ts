@@ -29,7 +29,7 @@ import { createRateLimiter } from "./middleware/rate-limiter";
 import { logRelayEvent } from "./middleware/logger";
 import { ProxyPool } from "./lib/proxy-pool";
 import { handleChatCompletion, listModels } from "./lib/ai-proxy";
-import { handleAnthropicMessages, listAnthropicModels } from "./lib/anthropic-proxy";
+import { handleAnthropicMessages } from "./lib/anthropic-proxy";
 
 import type { Server, ServerWebSocket } from "bun";
 

@@ -28,7 +28,7 @@ import { checkBodySize } from "../src/middleware/body-limiter";
 import { createRateLimiter } from "../src/middleware/rate-limiter";
 import { logRelayEvent } from "../src/middleware/logger";
 import { handleChatCompletion, listModels } from "../src/lib/ai-proxy";
-import { handleAnthropicMessages, listAnthropicModels } from "../src/lib/anthropic-proxy";
+import { handleAnthropicMessages } from "../src/lib/anthropic-proxy";
 
 // ─── Configuration ──────────────────────────────────────────────────────────────
 
@@ -428,7 +428,7 @@ export default {
 
 		// Models list
 		if (url.pathname === "/v1/models" && req.method === "GET") {
-			const models = [...listModels(), ...listAnthropicModels()].map((id) => ({
+			const models = listModels().map((id) => ({
 				id,
 				object: "model",
 				created: Math.floor(Date.now() / 1000),

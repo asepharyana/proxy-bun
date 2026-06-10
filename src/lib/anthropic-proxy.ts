@@ -40,53 +40,20 @@ interface AnthropicResponse {
 	usage: { input_tokens: number; output_tokens: number };
 }
 
-// ─── Anthropic model → backend model mapping ──────────────────────────────────
+// ─── Model resolution ─────────────────────────────────────────────────────────
 
-/** User-facing Anthropic model name → { backendModel, backendConfig }. */
-const ANTHROPIC_MODEL_MAP: Record<
-	string,
-	{ backendModel: string; config: BackendConfig }
-> = {
-	"claude-sonnet-4-20250514": {
-		backendModel: "deepseek-v4-flash-free",
-		config: MODEL_ROUTES["deepseek-v4-flash-free"]!,
-	},
-	"claude-sonnet-4": {
-		backendModel: "deepseek-v4-flash-free",
-		config: MODEL_ROUTES["deepseek-v4-flash-free"]!,
-	},
-	"claude-3-haiku-20240307": {
-		backendModel: "gpt-5.4-mini-no-login",
-		config: MODEL_ROUTES["gpt-5.4-mini-no-login"]!,
-	},
-	"claude-3-haiku": {
-		backendModel: "gpt-5.4-mini-no-login",
-		config: MODEL_ROUTES["gpt-5.4-mini-no-login"]!,
-	},
-	"claude-opus-4-20250514": {
-		backendModel: "deepseek/deepseek-v4-flash",
-		config: MODEL_ROUTES["deepseek/deepseek-v4-flash"]!,
-	},
-	"claude-opus-4": {
-		backendModel: "deepseek/deepseek-v4-flash",
-		config: MODEL_ROUTES["deepseek/deepseek-v4-flash"]!,
-	},
-};
-
-// Also allow using raw backend model names directly
+/** Resolve a model name to a backend config (uses MODEL_ROUTES directly). */
 function resolveAnthropicModel(
 	model: string,
 ): { backendModel: string; config: BackendConfig } | undefined {
-	if (ANTHROPIC_MODEL_MAP[model]) return ANTHROPIC_MODEL_MAP[model];
-	// Fallback — try using the model name directly as a backend route
 	const direct = MODEL_ROUTES[model];
 	if (direct) return { backendModel: model, config: direct };
 	return undefined;
 }
 
-/** List all available Anthropic model names. */
+/** List all available model names (same as OpenAI endpoint). */
 export function listAnthropicModels(): string[] {
-	return Object.keys(ANTHROPIC_MODEL_MAP);
+	return Object.keys(MODEL_ROUTES);
 }
 
 // ─── Translation: Anthropic → Backend (OpenAI-format) ───────────────────────
@@ -126,7 +93,7 @@ function anthropicToBackend(
 	}
 
 	const base: BackendBody = {
-		model: anthReq.model,
+		model: backendModel,
 		messages,
 		max_tokens: anthReq.max_tokens,
 		temperature: anthReq.temperature,
@@ -144,7 +111,7 @@ function anthropicToBackend(
 	// If backend has a custom adaptRequest, use it
 	if (config.adaptRequest) {
 		return config.adaptRequest({
-			model: anthReq.model,
+			model: backendModel,
 			messages,
 			temperature: anthReq.temperature,
 			max_tokens: anthReq.max_tokens,
