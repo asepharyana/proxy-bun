@@ -433,7 +433,8 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 		// Static routes
 		if (url.pathname === "/health") return handleHealth();
 		if (url.pathname === "/docs") return handleDocs();
-		if (url.pathname === "/" && req.method === "GET") return handleIndex();
+		if (url.pathname === "/" && req.method === "GET" && !req.headers.get("x-relay-target"))
+		return handleIndex();
 
 		// WebSocket upgrade check — if the target is ws:// or wss://,
 		// attempt to upgrade and relay.  This must happen before the

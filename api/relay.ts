@@ -362,10 +362,16 @@ export default {
 	async fetch(req: Request): Promise<Response> {
 		const url = new URL(req.url);
 
-		// Static routes
+		// Static routes — show index only when no relay target is requested
 		if (url.pathname === "/health") return handleHealth();
 		if (url.pathname === "/docs") return handleDocs();
-		if (url.pathname === "/" && req.method === "GET") return handleIndex();
+		if (
+			url.pathname === "/" &&
+			req.method === "GET" &&
+			!req.headers.get("x-relay-target")
+		) {
+			return handleIndex();
+		}
 
 		// WebSocket upgrade — not supported in Vercel Functions
 		if (
