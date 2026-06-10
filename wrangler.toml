@@ -3,10 +3,9 @@ main = "src/worker.ts"
 compatibility_date = "2025-12-01"
 compatibility_flags = ["nodejs_compat"]
 
-# ── Cloudflare account (fill in your Account ID) ─────────────────────────────
-# Find it in the Cloudflare Dashboard → Workers & Pages → right sidebar
-# account_id = ""
-# workers_dev = true
+# ── Cloudflare account ────────────────────────────────────────────
+account_id = "2bfa421c4f4a11cc11d684a3d14327db"
+workers_dev = true
 
 # ── Environment Variables ───────────────────────────────────────────────────
 # [vars]
