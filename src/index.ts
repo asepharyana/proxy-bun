@@ -28,6 +28,7 @@ import { checkBodySize } from "./middleware/body-limiter";
 import { createRateLimiter } from "./middleware/rate-limiter";
 import { logRelayEvent } from "./middleware/logger";
 import { ProxyPool } from "./lib/proxy-pool";
+import { handleChatCompletion, listModels } from "./lib/ai-proxy";
 
 import type { Server, ServerWebSocket } from "bun";
 
@@ -472,6 +473,45 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 		if (url.pathname === "/docs") return handleDocs();
 		if (url.pathname === "/" && req.method === "GET" && !req.headers.get("x-relay-target"))
 		return handleIndex();
+
+		// AI proxy routes — OpenAI-compatible API
+		if (url.pathname === "/v1/chat/completions") {
+			if (req.method === "OPTIONS") {
+				return createCorsPreflightResponse();
+			}
+			if (req.method !== "POST") {
+				return new Response("Method Not Allowed", { status: 405 });
+			}
+			try {
+				const body = await req.json();
+				return handleChatCompletion(body, proxyPool);
+			} catch (e) {
+				return new Response(
+					JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }),
+					{ status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+				);
+			}
+		}
+		if (url.pathname === "/v1/models" && req.method === "GET") {
+			return new Response(
+				JSON.stringify({
+					object: "list",
+					data: listModels().map((id) => ({
+						id,
+						object: "model",
+						created: Math.floor(Date.now() / 1000),
+						owned_by: "edge-proxy",
+					})),
+				}),
+				{
+					status: 200,
+					headers: {
+						"Content-Type": "application/json",
+						"Access-Control-Allow-Origin": "*",
+					},
+				},
+			);
+		}
 
 		// WebSocket upgrade check — if the target is ws:// or wss://,
 		// attempt to upgrade and relay.  This must happen before the
