@@ -1,10 +1,15 @@
 name = "edge-proxy-relay"
-main = "src/index.ts"
-compatibility_date = "2024-12-01"
+main = "src/worker.ts"
+compatibility_date = "2025-12-01"
 compatibility_flags = ["nodejs_compat"]
 
-[vars]
-NODE_VERSION = "22"
+# ── Cloudflare account (fill in your Account ID) ─────────────────────────────
+# Find it in the Cloudflare Dashboard → Workers & Pages → right sidebar
+# account_id = ""
+# workers_dev = true
 
-[env.production]
-name = "edge-proxy-relay-prod"
+# ── Environment Variables ───────────────────────────────────────────────────
+# [vars]
+# RELAY_TIMEOUT_MS = "30000"
+# RATE_LIMIT_MAX = "200"
+# RATE_LIMIT_WINDOW_MS = "60000"
