@@ -417,18 +417,22 @@ export async function handleAnthropicMessages(
 
 		try {
 			response = await fetch(url, init);
-			if (
-				response.ok &&
-				proxyPool &&
-				proxyPool.size > 0 &&
-				init.proxy &&
-				attempt > 0
-			) {
-				proxyPool.markSuccess();
+			if (response.ok) {
+				// Success — reset proxy failure if we used one
+				if (proxyPool && proxyPool.size > 0 && init.proxy && attempt > 0) {
+					proxyPool.markSuccess();
+				}
+				break;
 			}
-			if (response.ok || response.status < 500) break;
+			// Non-2xx — mark proxy as failed so next attempt rotates
+			if (proxyPool && proxyPool.size > 0 && init.proxy) {
+				proxyPool.markFailed();
+			}
 		} catch {
-			// fall through to next attempt
+			// Network error — mark proxy as failed, retry
+			if (proxyPool && proxyPool.size > 0 && init.proxy) {
+				proxyPool.markFailed();
+			}
 		}
 	}
 
