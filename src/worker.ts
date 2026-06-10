@@ -26,6 +26,8 @@ import {
 import { checkBodySize } from "./middleware/body-limiter";
 import { createRateLimiter } from "./middleware/rate-limiter";
 import { logRelayEvent } from "./middleware/logger";
+import { handleChatCompletion, listModels } from "./lib/ai-proxy";
+import { handleAnthropicMessages, listAnthropicModels } from "./lib/anthropic-proxy";
 
 // ─── Types ───────────────────────────────────────────────────────────────────────
 
@@ -387,6 +389,50 @@ export default {
 						"Access-Control-Allow-Origin": "*",
 					},
 				},
+			);
+		}
+
+		// AI proxy routes — OpenAI-compatible
+		if (url.pathname === "/v1/chat/completions") {
+			if (req.method === "OPTIONS") return createCorsPreflightResponse();
+			if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+			try {
+				const body = await req.json();
+				return handleChatCompletion(body);
+			} catch {
+				return new Response(
+					JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }),
+					{ status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+				);
+			}
+		}
+
+		// AI proxy routes — Anthropic-compatible
+		if (url.pathname === "/v1/messages") {
+			if (req.method === "OPTIONS") return createCorsPreflightResponse();
+			if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+			try {
+				const body = await req.json();
+				return handleAnthropicMessages(body);
+			} catch {
+				return new Response(
+					JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }),
+					{ status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+				);
+			}
+		}
+
+		// Models list
+		if (url.pathname === "/v1/models" && req.method === "GET") {
+			const models = [...listModels(), ...listAnthropicModels()].map((id) => ({
+				id,
+				object: "model",
+				created: Math.floor(Date.now() / 1000),
+				owned_by: "proxy",
+			}));
+			return new Response(
+				JSON.stringify({ object: "list", data: models }),
+				{ status: 200, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
 			);
 		}
 
