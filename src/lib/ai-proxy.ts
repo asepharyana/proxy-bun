@@ -76,11 +76,13 @@ export const MODEL_ROUTES: Record<string, BackendConfig> = {
 			messages: req.messages,
 		}),
 		adaptStreamLine: (line) => {
-			// surfsense returns lines like: data: {"content":"Hello","done":false}
 			if (!line.startsWith("data: ")) return null;
 			try {
 				const raw = JSON.parse(line.slice(6));
-				if (raw.done) return "data: [DONE]";
+				if (raw.type === "finish" || raw.done) return "data: [DONE]";
+				if (raw.type !== "text-delta") return null;
+				const text = raw.delta ?? raw.content ?? "";
+				if (!text) return null;
 				return `data: ${JSON.stringify({
 					id: `chatcmpl-${Date.now()}`,
 					object: "chat.completion.chunk",
@@ -89,7 +91,7 @@ export const MODEL_ROUTES: Record<string, BackendConfig> = {
 					choices: [
 						{
 							index: 0,
-							delta: { content: raw.content ?? "" },
+							delta: { content: text },
 							finish_reason: null,
 						},
 					],
