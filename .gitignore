@@ -13,6 +13,7 @@ coverage
 # logs
 logs
 _.log
+*.log
 report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # dotenv environment variable files
@@ -39,3 +40,7 @@ next-env.d.ts
 # OpenNext & Wrangler build output
 .open-next/
 .wrangler/
+
+.claude/
+
+.codegraph/

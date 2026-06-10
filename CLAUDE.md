@@ -1,3 +1,13 @@
+# Edge Proxy Relay
+
+A pure Bun HTTP and WebSocket relay proxy using `Bun.serve()`. No Next.js, no Express, no React, no Vercel Edge Runtime. Single entry point at `src/index.ts` -- deploys as a standalone Bun process.
+
+Key architecture facts:
+- Entry point: `src/index.ts` (was `src/app/route.ts` in the previous Next.js version)
+- Middleware stack: rate limiter, body limiter, structured logger, SSRF protection
+- WebSocket relay: bidirectional relay via `x-relay-target` header with `ws://` or `wss://`
+- Error classification: DNS errors -> 502, timeouts -> 504, SSRF blocks -> 403, rate limits -> 429
+- The old Next.js `src/app/route.ts` still exists as a legacy file but is no longer the active entry point
 
 Default to using Bun instead of Node.js.
 
