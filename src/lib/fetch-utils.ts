@@ -137,9 +137,13 @@ export async function fetchWithRetry(
   let lastError: unknown;
   let usedProxy = false;
 
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (proxyPool && proxyPool.size > 0) {
-      // Proactive proxy usage on every attempt, rotating each time
+  // Calculate max attempts: pool.size proxies + 1 direct fallback, min 3
+  const poolSize = proxyPool?.size ?? 0;
+  const maxAttempts = poolSize > 0 ? poolSize + 1 : 3;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (proxyPool && proxyPool.size > 0 && attempt < poolSize) {
+      // Use proxy from pool — first attempt gets current, rest rotate
       if (attempt === 0) {
         init.proxy = proxyPool.getProxyUrl()!;
         usedProxy = true;
@@ -150,13 +154,13 @@ export async function fetchWithRetry(
         usedProxy = true;
       }
     } else {
-      // No proxy pool — direct only
+      // Last resort — direct (no proxy)
       init.proxy = undefined;
       usedProxy = false;
     }
 
     const proxyShort = init.proxy ? init.proxy.replace(/https?:\/\//, "").replace(/@.*/, "@***") : "direct";
-    logProxy("fetchWithRetry", `attempt=${attempt + 1}/3 proxy=${proxyShort}`, { context });
+    logProxy("fetchWithRetry", `attempt=${attempt + 1}/${maxAttempts} proxy=${proxyShort}`, { context });
 
     try {
       response = await fetch(url, init);
@@ -186,11 +190,11 @@ export async function fetchWithRetry(
       const ctx = context ? `[${context}] ` : "";
       const errMsg = err instanceof Error ? err.message : String(err);
       logProxy("fetchWithRetry", `failed attempt=${attempt + 1} err=${errMsg}`, { context });
-      console.warn(`${ctx}fetch attempt ${attempt + 1}/3 failed: ${errMsg}`);
+      console.warn(`${ctx}fetch attempt ${attempt + 1}/${maxAttempts} failed: ${errMsg}`);
     }
   }
 
-  // All attempts exhausted
+  // All attempts exhausted — tried every proxy + direct
   logProxy("fetchWithRetry", "exhausted all retries", { context, hadResponse: !!response });
 
   // If we got at least one HTTP response, return it as-is so the caller
@@ -257,7 +261,7 @@ export async function fetchWithSessionRetry(
   sessionPool: SessionProxyPool | undefined,
   sessionId: string,
   context?: string,
-  maxRetries = 3,
+  maxRetries?: number,
 ): Promise<FetchWithRetryResult> {
   // Fallback when no session pool is available
   if (!sessionPool) {
@@ -270,24 +274,36 @@ export async function fetchWithSessionRetry(
     }
   }
 
+  // Exhaust all proxies + 1 direct fallback
+  const totalAttempts = maxRetries ?? sessionPool.size + 1;
   let lastError: unknown;
   let lastResponse: Response | undefined;
+  let triedDirect = false;
 
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    // First attempt: acquire() assigns a proxy to this session (least-loaded
-    // distribution so many concurrent users spread across different IPs).
-    // Subsequent attempts: getProxyUrl() reads the existing (or rotated) proxy.
-    const proxyUrl = attempt === 0
-      ? sessionPool.acquire(sessionId)
-      : sessionPool.getProxyUrl(sessionId);
-    if (proxyUrl) {
-      init.proxy = proxyUrl;
+  for (let attempt = 0; attempt < totalAttempts; attempt++) {
+    // Determine proxy for this attempt
+    if (attempt < sessionPool.size) {
+      // Use session-sticky proxy
+      const proxyUrl = attempt === 0
+        ? sessionPool.acquire(sessionId)
+        : sessionPool.getProxyUrl(sessionId);
+      if (proxyUrl) {
+        init.proxy = proxyUrl;
+      }
+      triedDirect = false;
+    } else if (!triedDirect) {
+      // Last resort — direct (no proxy)
+      init.proxy = undefined;
+      triedDirect = true;
+    } else {
+      // Already tried direct, exhausted everything
+      break;
     }
 
     const proxyShort = init.proxy
       ? init.proxy.replace(/https?:\/\//, "").replace(/@.*/, "@***")
       : "direct";
-    logProxy("fetchWithSessionRetry", `attempt=${attempt + 1}/${maxRetries} proxy=${proxyShort}`, {
+    logProxy("fetchWithSessionRetry", `attempt=${attempt + 1}/${totalAttempts} proxy=${proxyShort}`, {
       context,
       sessionId: sessionId.slice(0, 8),
     });
@@ -317,7 +333,7 @@ export async function fetchWithSessionRetry(
 
       const ctx = context ? `[${context}] ` : "";
       console.warn(
-        `${ctx}fetchWithSessionRetry attempt ${attempt + 1}/${maxRetries} ` +
+        `${ctx}fetchWithSessionRetry attempt ${attempt + 1}/${totalAttempts} ` +
           `failed with ${response.status}${rotated ? " (rotated proxy)" : ""}`,
       );
     } catch (err) {
@@ -332,14 +348,14 @@ export async function fetchWithSessionRetry(
 
       const ctx = context ? `[${context}] ` : "";
       console.warn(
-        `${ctx}fetchWithSessionRetry attempt ${attempt + 1}/${maxRetries} ` +
+        `${ctx}fetchWithSessionRetry attempt ${attempt + 1}/${totalAttempts} ` +
           `failed: ${errMsg}${rotated ? " (rotated proxy)" : ""}`,
       );
     }
   }
 
-  // All attempts exhausted
-  logProxy("fetchWithSessionRetry", "exhausted all retries", {
+  // All attempts exhausted — tried every proxy + direct
+  logProxy("fetchWithSessionRetry", "exhausted all retries — tried all proxies + direct", {
     context,
     sessionId: sessionId.slice(0, 8),
     hadResponse: !!lastResponse,

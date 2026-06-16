@@ -138,15 +138,30 @@ export class ProxyPool {
 
 	/**
 	 * Advance to the next proxy (round-robin, wraps around).
-	 * Returns the new current proxy or `null` if the pool is empty.
+	 * Skips proxies that have exceeded the failure threshold.
+	 * Returns the new current proxy or `null` if the pool is empty or
+	 * all proxies are failed.
 	 */
 	rotate(): ProxyEntry | null {
 		if (this.proxies.length === 0) return null;
 		const oldIndex = this.currentIndex;
-		this.currentIndex = (this.currentIndex + 1) % this.proxies.length;
-		const entry = this.proxies[this.currentIndex] ?? null;
-		logPool(`rotate ${oldIndex} -> ${this.currentIndex}`, { host: entry?.host });
-		return entry;
+		const startIndex = this.currentIndex;
+
+		// Keep advancing until we find a non-failed proxy or loop back
+		let checked = 0;
+		do {
+			this.currentIndex = (this.currentIndex + 1) % this.proxies.length;
+			checked++;
+			if (!this.isFailed()) {
+				const entry = this.proxies[this.currentIndex] ?? null;
+				logPool(`rotate ${oldIndex} -> ${this.currentIndex} (skipped ${checked - 1} failed)`);
+				return entry;
+			}
+		} while (this.currentIndex !== startIndex && checked <= this.proxies.length);
+
+		// All proxies failed — stay on current but log it
+		logPool(`rotate ${oldIndex} -> ${this.currentIndex} (all proxies failed)`);
+		return this.proxies[this.currentIndex] ?? null;
 	}
 
 	/**
