@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Edge Proxy — API Test</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #0d1117; color: #e1e4e8; padding: 1.5rem; }
+    main { max-width: 960px; margin: 0 auto; }
+    h1 { font-size: 1.5rem; color: #58a6ff; margin-bottom: 0.25rem; }
+    .sub { color: #8b949e; margin-bottom: 1.5rem; font-size: 0.9rem; }
+
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 1rem; overflow: hidden; }
+    .card-header { padding: 0.75rem 1rem; background: #1c2128; border-bottom: 1px solid #30363d; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 0.5rem; user-select: none; }
+    .card-header:hover { background: #21262d; }
+    .card-header .method { font-size: 0.7rem; padding: 1px 6px; border-radius: 3px; font-weight: 600; }
+    .get { background: #1f6feb33; color: #58a6ff; }
+    .post { background: #23863633; color: #3fb950; }
+    .card-body { padding: 1rem; display: none; }
+    .card.open .card-body { display: block; }
+    .card-header .arrow { margin-left: auto; transition: transform .15s; }
+    .card.open .arrow { transform: rotate(90deg); }
+
+    label { display: block; font-size: 0.8rem; color: #8b949e; margin-bottom: 0.25rem; }
+    input, textarea, select { width: 100%; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; color: #e1e4e8; padding: 0.5rem 0.75rem; font-family: inherit; font-size: 0.9rem; margin-bottom: 0.75rem; }
+    input:focus, textarea:focus { border-color: #58a6ff; outline: none; }
+    textarea { min-height: 60px; resize: vertical; font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 0.8rem; }
+    textarea.code { min-height: 120px; }
+
+    .row { display: flex; gap: 0.75rem; }
+    .row > * { flex: 1; }
+
+    .btn { background: #238636; color: #fff; border: none; border-radius: 6px; padding: 0.5rem 1.25rem; font-size: 0.85rem; cursor: pointer; font-weight: 500; }
+    .btn:hover { background: #2ea043; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-outline { background: transparent; border: 1px solid #30363d; color: #c9d1d9; }
+    .btn-outline:hover { background: #21262d; border-color: #8b949e; }
+    .btn-danger { background: #da3633; }
+    .btn-danger:hover { background: #f85149; }
+
+    .output { background: #0d1117; border: 1px solid #30363d; border-radius: 4px; padding: 0.75rem; margin-top: 0.5rem; }
+    .output pre { font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 0.78rem; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow: auto; color: #c9d1d9; }
+    .output .meta { font-size: 0.75rem; color: #8b949e; margin-bottom: 0.5rem; }
+    .output .meta .status.ok { color: #3fb950; }
+    .output .meta .status.err { color: #f85149; }
+
+    .toast { position: fixed; bottom: 1.5rem; right: 1.5rem; background: #1c2128; border: 1px solid #30363d; border-radius: 6px; padding: 0.75rem 1rem; font-size: 0.85rem; display: none; z-index: 100; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Edge Proxy Relay — API Test</h1>
+  <p class="sub">Test all proxy endpoints from the browser</p>
+
+  <!-- Global Auth -->
+  <div class="card open">
+    <div class="card-header">
+      <span class="method get">AUTH</span> API Key
+      <span class="arrow">▶</span>
+    </div>
+    <div class="card-body">
+      <label>API Key (default: <code>sk-dummy-key</code>)</label>
+      <div class="row">
+        <input type="text" id="apiKey" value="sk-dummy-key" />
+        <input type="text" id="baseUrl" value="http://localhost:3000" placeholder="http://localhost:3000" />
+      </div>
+    </div>
+  </div>
+
+  <!-- Health -->
+  <div class="card open">
+    <div class="card-header" onclick="toggleCard(this)">
+      <span class="method get">GET</span> /health
+      <span class="arrow">▶</span>
+    </div>
+    <div class="card-body">
+      <button class="btn" onclick="callHealth()">Ping Health</button>
+      <div id="output-health" class="output" style="display:none"><pre></pre></div>
+    </div>
+  </div>
+
+  <!-- Models -->
+  <div class="card open">
+    <div class="card-header" onclick="toggleCard(this)">
+      <span class="method get">GET</span> /v1/models
+      <span class="arrow">▶</span>
+    </div>
+    <div class="card-body">
+      <button class="btn" onclick="callModels()">List Models</button>
+      <div id="output-models" class="output" style="display:none"><pre></pre></div>
+    </div>
+  </div>
+
+  <!-- Chat Completions -->
+  <div class="card">
+    <div class="card-header" onclick="toggleCard(this)">
+      <span class="method post">POST</span> /v1/chat/completions
+      <span class="arrow">▶</span>
+    </div>
+    <div class="card-body">
+      <label>Model</label>
+      <input type="text" id="chatModel" value="gpt-4o-mini" />
+      <label>Messages (JSON array)</label>
+      <textarea id="chatMessages" class="code">[{"role":"user","content":"Say hello in one word"}]</textarea>
+      <label><input type="checkbox" id="chatStream" /> Stream (SSE)</label>
+      <div style="margin-top:0.5rem"><button class="btn" onclick="callChat()">Send</button></div>
+      <div id="output-chat" class="output" style="display:none"><pre></pre></div>
+    </div>
+  </div>
+
+  <!-- Anthropic Messages -->
+  <div class="card">
+    <div class="card-header" onclick="toggleCard(this)">
+      <span class="method post">POST</span> /v1/messages (Anthropic)
+      <span class="arrow">▶</span>
+    </div>
+    <div class="card-body">
+      <label>Model</label>
+      <input type="text" id="anthModel" value="claude-sonnet-4-6" />
+      <label>Max Tokens</label>
+      <input type="number" id="anthMaxTokens" value="256" />
+      <label>Messages (JSON)</label>
+      <textarea id="anthMessages" class="code">[{"role":"user","content":"Say hello in one word"}]</textarea>
+      <label><input type="checkbox" id="anthStream" /> Stream (SSE)</label>
+      <div style="margin-top:0.5rem"><button class="btn" onclick="callAnthropic()">Send</button></div>
+      <div id="output-anth" class="output" style="display:none"><pre></pre></div>
+    </div>
+  </div>
+
+  <!-- Generic Relay -->
+  <div class="card">
+    <div class="card-header" onclick="toggleCard(this)">
+      <span class="method post">RELAY</span> Generic HTTP Relay
+      <span class="arrow">▶</span>
+    </div>
+    <div class="card-body">
+      <label>Relay Target URL</label>
+      <input type="text" id="relayTarget" value="https://httpbin.org" />
+      <label>Relay Path</label>
+      <input type="text" id="relayPath" value="/get" />
+      <label>Method</label>
+      <select id="relayMethod"><option>GET</option><option>POST</option></select>
+      <label>Body (JSON, optional)</label>
+      <textarea id="relayBody" class="code" placeholder='{"test":true}'></textarea>
+      <div style="margin-top:0.5rem"><button class="btn" onclick="callRelay()">Send</button></div>
+      <div id="output-relay" class="output" style="display:none"><pre></pre></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+</main>
+
+<script>
+// --- Config ---
+function apiBase() { return document.getElementById('baseUrl').value || 'http://localhost:3000'; }
+function authHeaders() {
+  const k = document.getElementById('apiKey').value || 'sk-dummy-key';
+  return { 'Authorization': 'Bearer ' + k, 'Content-Type': 'application/json' };
+}
+
+// --- Toggle ---
+function toggleCard(header) {
+  header.parentElement.classList.toggle('open');
+}
+
+// --- Toast ---
+let toastTimer;
+function showToast(msg, ok = true) {
+  const el = document.getElementById('toast');
+  el.textContent = (ok ? '✓ ' : '✗ ') + msg;
+  el.style.display = 'block';
+  el.style.borderColor = ok ? '#3fb950' : '#f85149';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.style.display = 'none', 3000);
+}
+
+// --- Shared fetch ---
+async function apiFetch(method, path, body, { rawHeaders, stream } = {}) {
+  const headers = rawHeaders || authHeaders();
+  let resp;
+  if (stream) {
+    resp = await fetch(apiBase() + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  } else {
+    resp = await fetch(apiBase() + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  }
+  if (stream && resp.ok && resp.headers.get('content-type')?.includes('text/event-stream')) {
+    return { resp, streamReader: resp.body.getReader() };
+  }
+  let data = null;
+  const text = await resp.text();
+  try { data = JSON.parse(text); } catch { data = text; }
+  return { resp, data };
+}
+
+function showOutput(id, resp, data, raw) {
+  const el = document.getElementById('output-' + id);
+  el.style.display = 'block';
+  const ok = resp.status >= 200 && resp.status < 300;
+  el.innerHTML = `<div class="meta">
+    <span class="status ${ok ? 'ok' : 'err'}">${resp.status} ${resp.statusText}</span>
+    ${elapsed()}ms
+  </div>
+  <pre>${escapeHtml(typeof data === 'string' ? data : JSON.stringify(data, null, 2)).slice(0, 10000)}</pre>`;
+  showToast(`${resp.status} ${resp.statusText}`, ok);
+}
+
+function streamOutput(id, chunk) {
+  const el = document.getElementById('output-' + id);
+  el.style.display = 'block';
+  const pre = el.querySelector('pre');
+  if (!pre) {
+    el.innerHTML = `<div class="meta">streaming…</div><pre></pre>`;
+  }
+  const p = el.querySelector('pre');
+  p.textContent += chunk;
+  p.scrollTop = p.scrollHeight;
+}
+
+let _elapsedBase = 0;
+function elapsed() { return Date.now() - _elapsedBase; }
+
+// --- Health ---
+async function callHealth() {
+  _elapsedBase = Date.now();
+  try {
+    const { resp, data } = await apiFetch('GET', '/health');
+    showOutput('health', resp, data);
+  } catch (e) { showOutput('health', {status:0,statusText:'Network Error'}, e.message); showToast(e.message, false); }
+}
+
+// --- Models ---
+async function callModels() {
+  _elapsedBase = Date.now();
+  try {
+    const { resp, data } = await apiFetch('GET', '/v1/models');
+    showOutput('models', resp, data);
+  } catch (e) { showOutput('models', {status:0,statusText:'Network Error'}, e.message); showToast(e.message, false); }
+}
+
+// --- Chat Completions ---
+async function callChat() {
+  _elapsedBase = Date.now();
+  const stream = document.getElementById('chatStream').checked;
+  let messages;
+  try { messages = JSON.parse(document.getElementById('chatMessages').value); }
+  catch { showToast('Invalid messages JSON', false); return; }
+
+  const body = {
+    model: document.getElementById('chatModel').value || 'gpt-4o-mini',
+    messages,
+    stream,
+    max_tokens: 128,
+  };
+
+  try {
+    if (stream) {
+      const el = document.getElementById('output-chat');
+      el.style.display = 'block';
+      el.innerHTML = `<div class="meta">streaming text/event-stream …</div><pre></pre>`;
+      const resp = await fetch(apiBase() + '/v1/chat/completions', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) {
+        showOutput('chat', resp, await resp.text());
+        return;
+      }
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let done;
+      while (!done) {
+        const { value, done: d } = await reader.read();
+        done = d;
+        if (value) streamOutput('chat', decoder.decode(value));
+      }
+      showToast('stream complete');
+    } else {
+      const { resp, data } = await apiFetch('POST', '/v1/chat/completions', body);
+      showOutput('chat', resp, data);
+    }
+  } catch (e) { showOutput('chat', {status:0,statusText:'Network Error'}, e.message); showToast(e.message, false); }
+}
+
+// --- Anthropic ---
+async function callAnthropic() {
+  _elapsedBase = Date.now();
+  const stream = document.getElementById('anthStream').checked;
+  let messages;
+  try { messages = JSON.parse(document.getElementById('anthMessages').value); }
+  catch { showToast('Invalid messages JSON', false); return; }
+
+  const body = {
+    model: document.getElementById('anthModel').value || 'claude-sonnet-4-6',
+    max_tokens: parseInt(document.getElementById('anthMaxTokens').value) || 256,
+    messages,
+    stream,
+  };
+
+  try {
+    if (stream) {
+      const el = document.getElementById('output-anth');
+      el.style.display = 'block';
+      el.innerHTML = `<div class="meta">streaming …</div><pre></pre>`;
+      const resp = await fetch(apiBase() + '/v1/messages', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) {
+        showOutput('anth', resp, await resp.text());
+        return;
+      }
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let done;
+      while (!done) {
+        const { value, done: d } = await reader.read();
+        done = d;
+        if (value) streamOutput('anth', decoder.decode(value));
+      }
+      showToast('stream complete');
+    } else {
+      const { resp, data } = await apiFetch('POST', '/v1/messages', body);
+      showOutput('anth', resp, data);
+    }
+  } catch (e) { showOutput('anth', {status:0,statusText:'Network Error'}, e.message); showToast(e.message, false); }
+}
+
+// --- Relay ---
+async function callRelay() {
+  _elapsedBase = Date.now();
+  const target = document.getElementById('relayTarget').value;
+  const path = document.getElementById('relayPath').value || '/';
+  const method = document.getElementById('relayMethod').value;
+  const rawBody = document.getElementById('relayBody').value;
+
+  try {
+    const resp = await fetch(apiBase() + '/', {
+      method,
+      headers: {
+        'x-relay-target': target,
+        'x-relay-path': path,
+        ...(rawBody ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: rawBody || undefined,
+    });
+    const text = await resp.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = text; }
+    showOutput('relay', resp, data);
+  } catch (e) { showOutput('relay', {status:0,statusText:'Network Error'}, e.message); showToast(e.message, false); }
+}
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+</script>
+</body>
+</html>

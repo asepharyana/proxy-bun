@@ -461,6 +461,14 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 		// Static routes
 		if (url.pathname === "/health") return handleHealth();
 		if (url.pathname === "/docs") return handleDocs();
+		if (url.pathname === "/test") {
+			const file = Bun.file("public/test-api.html");
+			const exists = await file.exists();
+			return new Response(exists ? file : "Not found", {
+				status: exists ? 200 : 404,
+				headers: { "Content-Type": "text/html; charset=utf-8" },
+			});
+		}
 		if (url.pathname === "/" && req.method === "GET" && !req.headers.get("x-relay-target"))
 			return handleIndex();
 
