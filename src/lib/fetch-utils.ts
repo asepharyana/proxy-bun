@@ -89,6 +89,17 @@ function logProxy(method: string, msg: string, extra?: Record<string, unknown>):
   console.log(parts.join(" "));
 }
 
+// ─── Model extraction from context ───────────────────────────────────
+
+/**
+ * Extract model identifier from the context string.
+ * Context format: "provider:modelname" (e.g. "openai:deepseek-v4-flash-free").
+ * Returns undefined when no context given (backward-compatible).
+ */
+function extractModel(context?: string): string | undefined {
+  return context || undefined;
+}
+
 // ─── Error sanitization (prevent leaking upstream details) ──────────────
 
 /**
@@ -148,7 +159,7 @@ export async function fetchWithRetry(
         init.proxy = proxyPool.getProxyUrl()!;
         usedProxy = true;
       } else {
-        const next = proxyPool.rotate();
+        const next = proxyPool.rotate(extractModel(context));
         if (!next) break;
         init.proxy = proxyPool.getProxyUrl()!;
         usedProxy = true;
@@ -176,14 +187,19 @@ export async function fetchWithRetry(
       lastError = new Error(`Upstream returned ${response.status}`);
       logProxy("fetchWithRetry", `non-2xx attempt=${attempt + 1} status=${response.status}`, { context });
       if (usedProxy && proxyPool && proxyPool.size > 0 && init.proxy) {
+        const model = extractModel(context);
+        // If rate-limited, put proxy in per-model cooldown
+        if (response.status === 429 && model) {
+          proxyPool.markRateLimited(model);
+        }
         proxyPool.markFailed();
-        proxyPool.rotate();
+        proxyPool.rotate(model);
       }
     } catch (err) {
       lastError = err;
       if (usedProxy && proxyPool && proxyPool.size > 0 && init.proxy) {
         proxyPool.markFailed();
-        proxyPool.rotate();
+        proxyPool.rotate(extractModel(context));
       }
 
       // Log the actual error so operators can diagnose
@@ -324,7 +340,12 @@ export async function fetchWithSessionRetry(
       // Non-2xx — rotate proxy immediately for the next attempt
       lastError = new Error(`Upstream returned ${response.status}`);
       lastResponse = response;
-      const rotated = sessionPool.rotateNow(sessionId);
+      const model = extractModel(context);
+      // If rate-limited, put proxy in per-model cooldown
+      if (response.status === 429 && model) {
+        sessionPool.markRateLimited(sessionId, model);
+      }
+      const rotated = sessionPool.rotateNow(sessionId, model);
       logProxy("fetchWithSessionRetry", `non-2xx attempt=${attempt + 1} status=${response.status} rotated=${rotated}`, {
         context,
         sessionId: sessionId.slice(0, 8),
@@ -338,7 +359,7 @@ export async function fetchWithSessionRetry(
       );
     } catch (err) {
       lastError = err;
-      const rotated = sessionPool.rotateNow(sessionId);
+      const rotated = sessionPool.rotateNow(sessionId, extractModel(context));
       const errMsg = err instanceof Error ? err.message : String(err);
       logProxy("fetchWithSessionRetry", `failed attempt=${attempt + 1} err=${errMsg} rotated=${rotated}`, {
         context,
