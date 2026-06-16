@@ -105,9 +105,10 @@ export interface FetchWithRetryResult {
 }
 
 /**
- * Execute an upstream `fetch` with automatic retry and proxy fallback.
+ * Execute an upstream `fetch` with automatic retry and proxy rotation.
  *
- * Strategy: direct first → proxy-1 on failure → rotate proxy on failure.
+ * Strategy: proxy pool on every attempt (rotate each retry).
+ * Falls back to direct when no pool is available.
  * Logs every failure to `console.warn` so the operator can diagnose without
  * the error body leaking to the downstream client.
  */
@@ -122,18 +123,21 @@ export async function fetchWithRetry(
   let usedProxy = false;
 
   for (let attempt = 0; attempt < 3; attempt++) {
-    if (attempt === 0) {
-      init.proxy = undefined; // direct
-    } else if (attempt === 1 && proxyPool && proxyPool.size > 0) {
-      usedProxy = true;
-      init.proxy = proxyPool.getProxyUrl()!;
-    } else if (attempt === 2 && proxyPool && proxyPool.size > 0) {
-      const next = proxyPool.rotate();
-      if (!next) break;
-      usedProxy = true;
-      init.proxy = proxyPool.getProxyUrl()!;
+    if (proxyPool && proxyPool.size > 0) {
+      // Proactive proxy usage on every attempt, rotating each time
+      if (attempt === 0) {
+        init.proxy = proxyPool.getProxyUrl()!;
+        usedProxy = true;
+      } else {
+        const next = proxyPool.rotate();
+        if (!next) break;
+        init.proxy = proxyPool.getProxyUrl()!;
+        usedProxy = true;
+      }
     } else {
-      break;
+      // No proxy pool — direct only
+      init.proxy = undefined;
+      usedProxy = false;
     }
 
     try {
@@ -213,9 +217,11 @@ function classifyFetchErrorSafe(error: unknown): {
 /**
  * Execute an upstream `fetch` using a session-sticky proxy with retry.
  *
- * Strategy: session-sticky proxy (via SessionProxyPool) on attempt 1; on
- * failure the session's proxy is marked failed — which auto-rotates if the
- * failure threshold is exceeded — and the request retries with the new proxy.
+ * Strategy: acquire() on attempt 0 (least-loaded assignment), then
+ * getProxyUrl() on subsequent attempts (reads the existing or rotated proxy).
+ * On persistent failure the session's proxy is marked failed — which
+ * auto-rotates if the failure threshold is exceeded — and the request
+ * retries with the new proxy.
  *
  * SSE streams: the initial request is retried normally. Once the response body
  * starts streaming, mid-stream errors are **not** retried; the session is
@@ -242,7 +248,12 @@ export async function fetchWithSessionRetry(
   let lastError: unknown;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
-    const proxyUrl = sessionPool.getProxyUrl(sessionId);
+    // First attempt: acquire() assigns a proxy to this session (least-loaded
+    // distribution so many concurrent users spread across different IPs).
+    // Subsequent attempts: getProxyUrl() reads the existing (or rotated) proxy.
+    const proxyUrl = attempt === 0
+      ? sessionPool.acquire(sessionId)
+      : sessionPool.getProxyUrl(sessionId);
     if (proxyUrl) {
       init.proxy = proxyUrl;
     }
