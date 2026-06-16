@@ -490,6 +490,7 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 			try {
 				const body = await req.json();
 				const sessionId = crypto.randomUUID();
+				console.log(`[index] POST /v1/chat/completions session=${sessionId.slice(0, 8)} model=${(body as any).model} poolSize=${proxyPool.size} sessionPool.active=${sessionPool.activeSessions}`);
 				return handleChatCompletion(body, proxyPool, sessionPool, sessionId);
 			} catch {
 				return new Response(
@@ -512,6 +513,7 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 			try {
 				const body = await req.json();
 				const sessionId = crypto.randomUUID();
+				console.log(`[index] POST /v1/messages session=${sessionId.slice(0, 8)} model=${(body as any).model} poolSize=${proxyPool.size} sessionPool.active=${sessionPool.activeSessions}`);
 				return handleAnthropicMessages(body, proxyPool, sessionPool, sessionId);
 			} catch {
 				return new Response(
