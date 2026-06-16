@@ -74,6 +74,21 @@ export class SSELineBuffer {
   }
 }
 
+// ─── Structured logging helper ─────────────────────────────────────────
+
+const LOG_PREFIX = "[fetch-utils]";
+
+function logProxy(method: string, msg: string, extra?: Record<string, unknown>): void {
+  const ts = new Date().toISOString().slice(11, 23);
+  const parts = [`${LOG_PREFIX} ${ts}`, `method=${method}`, msg];
+  if (extra) {
+    for (const [k, v] of Object.entries(extra)) {
+      parts.push(`${k}=${v ?? "null"}`);
+    }
+  }
+  console.log(parts.join(" "));
+}
+
 // ─── Error sanitization (prevent leaking upstream details) ──────────────
 
 /**
@@ -140,17 +155,22 @@ export async function fetchWithRetry(
       usedProxy = false;
     }
 
+    const proxyShort = init.proxy ? init.proxy.replace(/https?:\/\//, "").replace(/@.*/, "@***") : "direct";
+    logProxy("fetchWithRetry", `attempt=${attempt + 1}/3 proxy=${proxyShort}`, { context });
+
     try {
       response = await fetch(url, init);
       if (response.ok) {
         if (usedProxy && proxyPool && proxyPool.size > 0) {
           proxyPool.markSuccess();
         }
+        logProxy("fetchWithRetry", `success attempt=${attempt + 1} status=${response.status}`, { context });
         return { response };
       }
 
       // Non-2xx — mark proxy as failed and retry
       lastError = new Error(`Upstream returned ${response.status}`);
+      logProxy("fetchWithRetry", `non-2xx attempt=${attempt + 1} status=${response.status}`, { context });
       if (usedProxy && proxyPool && proxyPool.size > 0 && init.proxy) {
         proxyPool.markFailed();
         usedProxy = false;
@@ -165,6 +185,7 @@ export async function fetchWithRetry(
       // Log the actual error so operators can diagnose
       const ctx = context ? `[${context}] ` : "";
       const errMsg = err instanceof Error ? err.message : String(err);
+      logProxy("fetchWithRetry", `failed attempt=${attempt + 1} err=${errMsg}`, { context });
       console.warn(`${ctx}fetch attempt ${attempt + 1}/3 failed: ${errMsg}`);
     }
   }
@@ -172,10 +193,12 @@ export async function fetchWithRetry(
   // All attempts exhausted — classify the last error
   if (!response) {
     const err = lastError ?? new Error("All connection attempts failed");
+    logProxy("fetchWithRetry", "exhausted all retries", { context });
     return { errorClassification: classifyFetchErrorSafe(err) };
   }
 
   // Non-2xx but we have a response — pass it along (caller handles it)
+  logProxy("fetchWithRetry", `returning non-2xx response status=${response.status}`, { context });
   return { response };
 }
 
@@ -237,6 +260,7 @@ export async function fetchWithSessionRetry(
 ): Promise<FetchWithRetryResult> {
   // Fallback when no session pool is available
   if (!sessionPool) {
+    logProxy("fetchWithSessionRetry", "no session pool — direct fetch", { context, sessionId: sessionId.slice(0, 8) });
     try {
       const response = await fetch(url, init);
       return { response };
@@ -258,17 +282,35 @@ export async function fetchWithSessionRetry(
       init.proxy = proxyUrl;
     }
 
+    const proxyShort = init.proxy
+      ? init.proxy.replace(/https?:\/\//, "").replace(/@.*/, "@***")
+      : "direct";
+    logProxy("fetchWithSessionRetry", `attempt=${attempt + 1}/${maxRetries} proxy=${proxyShort}`, {
+      context,
+      sessionId: sessionId.slice(0, 8),
+    });
+
     try {
       const response = await fetch(url, init);
 
       if (response.ok) {
         sessionPool.markSuccess(sessionId);
+        logProxy("fetchWithSessionRetry", `success attempt=${attempt + 1} status=${response.status}`, {
+          context,
+          sessionId: sessionId.slice(0, 8),
+          proxy: proxyShort,
+        });
         return { response };
       }
 
       // Non-2xx — mark session failed and retry
       lastError = new Error(`Upstream returned ${response.status}`);
       const rotated = sessionPool.markFailed(sessionId);
+      logProxy("fetchWithSessionRetry", `non-2xx attempt=${attempt + 1} status=${response.status} rotated=${rotated}`, {
+        context,
+        sessionId: sessionId.slice(0, 8),
+        proxy: proxyShort,
+      });
 
       const ctx = context ? `[${context}] ` : "";
       console.warn(
@@ -278,9 +320,14 @@ export async function fetchWithSessionRetry(
     } catch (err) {
       lastError = err;
       const rotated = sessionPool.markFailed(sessionId);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logProxy("fetchWithSessionRetry", `failed attempt=${attempt + 1} err=${errMsg} rotated=${rotated}`, {
+        context,
+        sessionId: sessionId.slice(0, 8),
+        proxy: proxyShort,
+      });
 
       const ctx = context ? `[${context}] ` : "";
-      const errMsg = err instanceof Error ? err.message : String(err);
       console.warn(
         `${ctx}fetchWithSessionRetry attempt ${attempt + 1}/${maxRetries} ` +
           `failed: ${errMsg}${rotated ? " (rotated proxy)" : ""}`,
@@ -289,6 +336,10 @@ export async function fetchWithSessionRetry(
   }
 
   // All attempts exhausted — release session and classify last error
+  logProxy("fetchWithSessionRetry", "exhausted all retries — releasing session", {
+    context,
+    sessionId: sessionId.slice(0, 8),
+  });
   sessionPool.release(sessionId);
   const err = lastError ?? new Error("All session proxy attempts failed");
   return { errorClassification: classifyFetchErrorSafe(err) };

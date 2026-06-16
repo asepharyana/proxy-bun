@@ -19,6 +19,19 @@ export interface ProxyEntry {
 
 // --- ProxyPool ---------------------------------------------------------------
 
+const POOL_PREFIX = "[proxy-pool]";
+
+function logPool(msg: string, extra?: Record<string, unknown>): void {
+	const ts = new Date().toISOString().slice(11, 23);
+	const parts = [`${POOL_PREFIX} ${ts}`, msg];
+	if (extra) {
+		for (const [k, v] of Object.entries(extra)) {
+			parts.push(`${k}=${v ?? "null"}`);
+		}
+	}
+	console.log(parts.join(" "));
+}
+
 export class ProxyPool {
 	private proxies: ProxyEntry[] = [];
 	private currentIndex = 0;
@@ -71,11 +84,7 @@ export class ProxyPool {
 		this.currentIndex = 0;
 		this.failures.clear();
 
-		if (this.proxies.length > 0) {
-			console.log(
-				`[proxy-pool] Loaded ${this.proxies.length} proxies from ${filePath}`,
-			);
-		}
+		logPool(`loaded ${this.proxies.length} proxies from ${filePath}`);
 	}
 
 	/**
@@ -112,7 +121,9 @@ export class ProxyPool {
 	getProxyUrl(): string | null {
 		const entry = this.getCurrent();
 		if (!entry) return null;
-		return this.formatProxyUrl(entry);
+		const url = this.formatProxyUrl(entry);
+		logPool(`getProxyUrl -> ${entry.host}:${entry.port}`, { index: this.currentIndex });
+		return url;
 	}
 
 	/** Build a `http://user:pass@host:port` URL from an entry. */
@@ -131,8 +142,11 @@ export class ProxyPool {
 	 */
 	rotate(): ProxyEntry | null {
 		if (this.proxies.length === 0) return null;
+		const oldIndex = this.currentIndex;
 		this.currentIndex = (this.currentIndex + 1) % this.proxies.length;
-		return this.proxies[this.currentIndex] ?? null;
+		const entry = this.proxies[this.currentIndex] ?? null;
+		logPool(`rotate ${oldIndex} -> ${this.currentIndex}`, { host: entry?.host });
+		return entry;
 	}
 
 	/**
@@ -152,6 +166,7 @@ export class ProxyPool {
 		this.failures.set(key, count);
 
 		const th = threshold ?? this.failureThreshold;
+		logPool(`markFailed ${key} (${count}/${th})`);
 		if (count >= th) {
 			console.warn(
 				`[proxy-pool] Proxy ${key} failed ${count}/${th} times -- skipping`,
@@ -164,7 +179,9 @@ export class ProxyPool {
 		const entry = this.getCurrent();
 		if (!entry) return true;
 		const key = `${entry.host}:${entry.port}`;
-		return (this.failures.get(key) ?? 0) >= (threshold ?? this.failureThreshold);
+		const failed = (this.failures.get(key) ?? 0) >= (threshold ?? this.failureThreshold);
+		if (failed) logPool(`isFailed true for ${key}`);
+		return failed;
 	}
 
 	/** Reset the failure counter for the current proxy. */
@@ -172,6 +189,7 @@ export class ProxyPool {
 		const entry = this.getCurrent();
 		if (!entry) return;
 		this.failures.delete(`${entry.host}:${entry.port}`);
+		logPool(`markSuccess ${entry.host}:${entry.port}`);
 	}
 
 	/** Set the failure count that triggers a permanent skip. */
@@ -215,6 +233,7 @@ export class SessionProxyPool {
 			if (poolOrPath) this.pool.load(poolOrPath);
 		}
 		this.failureThreshold = 3;
+		logPool(`SessionProxyPool created, poolSize=${this.pool.size}`);
 	}
 
 	/** Number of available proxies in the underlying pool. */
@@ -240,6 +259,7 @@ export class SessionProxyPool {
 
 		const existing = this.sessions.get(sessionId);
 		if (existing !== undefined) {
+			logPool(`acquire existing session=${sessionId.slice(0, 8)} proxyIndex=${existing.proxyIndex}`);
 			return this.formatProxyUrlAtIndex(existing.proxyIndex);
 		}
 
@@ -255,6 +275,8 @@ export class SessionProxyPool {
 		}
 		usedBy.add(sessionId);
 
+		const entry = this.poolEntryAtIndex(index);
+		logPool(`acquire session=${sessionId.slice(0, 8)} -> proxyIndex=${index} host=${entry?.host} activeSessions=${this.activeSessions}`);
 		return this.formatProxyUrlAtIndex(index);
 	}
 
@@ -262,6 +284,8 @@ export class SessionProxyPool {
 	getProxyUrl(sessionId: string): string | null {
 		const info = this.sessions.get(sessionId);
 		if (!info) return null;
+		const entry = this.poolEntryAtIndex(info.proxyIndex);
+		logPool(`getProxyUrl session=${sessionId.slice(0, 8)} proxyIndex=${info.proxyIndex} host=${entry?.host}`);
 		return this.formatProxyUrlAtIndex(info.proxyIndex);
 	}
 
@@ -277,6 +301,8 @@ export class SessionProxyPool {
 		}
 
 		this.sessions.delete(sessionId);
+		const entry = this.poolEntryAtIndex(info.proxyIndex);
+		logPool(`release session=${sessionId.slice(0, 8)} proxyIndex=${info.proxyIndex} host=${entry?.host} activeSessions=${this.activeSessions}`);
 	}
 
 	/**
@@ -292,9 +318,12 @@ export class SessionProxyPool {
 		if (!info) return false;
 
 		info.failures += 1;
+		logPool(`markFailed session=${sessionId.slice(0, 8)} proxyIndex=${info.proxyIndex} failures=${info.failures}/${this.failureThreshold}`);
+
 		if (info.failures < this.failureThreshold) return false;
 
 		const oldIndex = info.proxyIndex;
+		const oldEntry = this.poolEntryAtIndex(oldIndex);
 
 		// Mark in underlying pool (public API only works on currentIndex)
 		const savedIdx = (this.pool as any).currentIndex as number;
@@ -314,6 +343,7 @@ export class SessionProxyPool {
 		if (newIndex === -1 || newIndex === oldIndex) {
 			// Single-proxy pool or none available — reset failures, stay put
 			this.sessions.set(sessionId, { proxyIndex: oldIndex, failures: 0 });
+			logPool(`markFailed no alternative, staying on oldIndex=${oldIndex} host=${oldEntry?.host}`);
 			return false;
 		}
 
@@ -326,6 +356,8 @@ export class SessionProxyPool {
 		}
 		newUsedBy.add(sessionId);
 
+		const newEntry = this.poolEntryAtIndex(newIndex);
+		logPool(`markFailed rotated session=${sessionId.slice(0, 8)} ${oldEntry?.host} -> ${newEntry?.host}`);
 		return true;
 	}
 
@@ -334,6 +366,7 @@ export class SessionProxyPool {
 		const info = this.sessions.get(sessionId);
 		if (!info) return;
 		info.failures = 0;
+		logPool(`markSuccess session=${sessionId.slice(0, 8)} proxyIndex=${info.proxyIndex}`);
 	}
 
 	// -- Internals ----------------------------------------------------------------
@@ -362,12 +395,14 @@ export class SessionProxyPool {
 
 		for (let i = 0; i < this.pool.size; i++) {
 			const count = this.proxyUsage.get(i)?.size ?? 0;
+			logPool(`pickLeastUsed proxy[${i}] count=${count}`);
 			if (count < bestCount) {
 				bestCount = count;
 				bestIndex = i;
 			}
 		}
 
+		logPool(`pickLeastUsed selected index=${bestIndex} count=${bestCount}`);
 		return bestIndex;
 	}
 
