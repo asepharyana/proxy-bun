@@ -12,10 +12,8 @@
  * Streaming (SSE) is supported for all backends.
  */
 
-import type { ProxyPool } from "./proxy-pool";
-import { fetchWithRetry } from "./fetch-utils";
-import { SSELineBuffer } from "./fetch-utils";
-import { isDevMode } from "./fetch-utils";
+import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
+import { fetchWithRetry, fetchWithSessionRetry, SSELineBuffer, isDevMode, type FetchWithRetryResult } from "./fetch-utils";
 
 // --- Types -------------------------------------------------------------------
 
@@ -315,10 +313,30 @@ function openAIError(status: number, message: string, type: string): Response {
 
 /**
  * Handle an OpenAI-compatible chat completions request.
+ *
+ * Two calling conventions:
+ *   1. Standard:    (body, proxyPool?)
+ *   2. Session-aware: (body, proxyPool?, sessionPool, sessionId)
+ *
+ * When both `sessionPool` and `sessionId` are present the request uses
+ * session-sticky proxy allocation via `fetchWithSessionRetry`; otherwise
+ * the existing `fetchWithRetry` path is used (backward-compatible).
  */
 export async function handleChatCompletion(
 	body: unknown,
 	proxyPool?: ProxyPool,
+): Promise<Response>;
+export async function handleChatCompletion(
+	body: unknown,
+	proxyPool?: ProxyPool,
+	sessionPool?: SessionProxyPool,
+	sessionId?: string,
+): Promise<Response>;
+export async function handleChatCompletion(
+	body: unknown,
+	proxyPool?: ProxyPool,
+	sessionPool?: SessionProxyPool,
+	sessionId?: string,
 ): Promise<Response> {
 	// -- Input validation -------------------------------------------------------
 	const validationError = validateChatRequest(body);
@@ -340,13 +358,11 @@ export async function handleChatCompletion(
 	const wantsStream = req.stream === true;
 	const { url, init } = buildBackendRequest(req, config);
 
-	// -- Execute (direct -> proxy fallback) with shared retry -------------------
-	const result = await fetchWithRetry(
-		url,
-		init,
-		proxyPool,
-		`openai:${req.model}`,
-	);
+	// -- Execute with session-aware or standard retry --------------------------
+	const result: FetchWithRetryResult =
+		sessionPool && sessionId
+			? await fetchWithSessionRetry(url, init, sessionPool, sessionId, `openai:${req.model}`)
+			: await fetchWithRetry(url, init, proxyPool, `openai:${req.model}`);
 
 	if (result.errorClassification) {
 		return new Response(
@@ -389,7 +405,10 @@ export async function handleChatCompletion(
 				"Access-Control-Allow-Origin": "*",
 				"X-Accel-Buffering": "no",
 			};
-			return new Response(response.body, { status: 200, headers });
+			return new Response(
+				wrapStreamMaybe(response.body!, sessionPool, sessionId),
+				{ status: 200, headers },
+			);
 		}
 
 		// Transform the stream
@@ -398,20 +417,26 @@ export async function handleChatCompletion(
 			config,
 			req,
 		);
-		return new Response(transformed, {
-			status: 200,
-			headers: {
-				"Content-Type": "text/event-stream",
-				"Cache-Control": "no-cache",
-				Connection: "keep-alive",
-				"Access-Control-Allow-Origin": "*",
-				"X-Accel-Buffering": "no",
+		return new Response(
+			wrapStreamMaybe(transformed, sessionPool, sessionId),
+			{
+				status: 200,
+				headers: {
+					"Content-Type": "text/event-stream",
+					"Cache-Control": "no-cache",
+					Connection: "keep-alive",
+					"Access-Control-Allow-Origin": "*",
+					"X-Accel-Buffering": "no",
+				},
 			},
-		});
+		);
 	}
 
 	// -- Handle non-streaming response ------------------------------------------
 	const text = await response.text();
+	if (sessionPool && sessionId) {
+		sessionPool.release(sessionId);
+	}
 	const adapted = parseJSONResponse(text, config, req);
 
 	return new Response(JSON.stringify(adapted), {
@@ -502,6 +527,50 @@ function transformStream(
 				}
 				controller.close();
 			}
+		},
+	});
+}
+
+// --- Stream cleanup wrapper ----------------------------------------------------
+
+/**
+ * If a session is active, wrap the stream so the session is released on end/error.
+ * Otherwise pass through the stream unchanged.
+ */
+function wrapStreamMaybe(
+	body: ReadableStream,
+	sessionPool?: SessionProxyPool,
+	sessionId?: string,
+): ReadableStream {
+	if (!sessionPool || !sessionId) return body;
+	return wrapStreamWithCleanup(body, () => sessionPool.release(sessionId));
+}
+
+/**
+ * Wraps a ReadableStream and calls `cleanup` when the stream ends, errors,
+ * or is cancelled by the consumer.
+ */
+function wrapStreamWithCleanup(body: ReadableStream, cleanup: () => void): ReadableStream {
+	const reader = body.getReader();
+
+	return new ReadableStream({
+		async pull(controller) {
+			try {
+				const { done, value } = await reader.read();
+				if (done) {
+					cleanup();
+					controller.close();
+					return;
+				}
+				controller.enqueue(value);
+			} catch (err) {
+				cleanup();
+				controller.error(err);
+			}
+		},
+		cancel(reason) {
+			cleanup();
+			reader.cancel(reason);
 		},
 	});
 }

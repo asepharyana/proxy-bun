@@ -10,9 +10,9 @@
  *   - Backend SSE stream -> Anthropic SSE events
  */
 
-import type { ProxyPool } from "./proxy-pool";
+import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
 import { MODEL_ROUTES, type BackendConfig } from "./ai-proxy";
-import { fetchWithRetry } from "./fetch-utils";
+import { fetchWithRetry, fetchWithSessionRetry, type FetchWithRetryResult } from "./fetch-utils";
 import { SSELineBuffer } from "./fetch-utils";
 import { isDevMode } from "./fetch-utils";
 
@@ -449,10 +449,30 @@ function anthropicError(status: number, message: string, type: string): Response
 
 /**
  * Handle an Anthropic-compatible messages request.
+ *
+ * Two calling conventions:
+ *   1. Standard:    (body, proxyPool?)
+ *   2. Session-aware: (body, proxyPool?, sessionPool, sessionId)
+ *
+ * When both `sessionPool` and `sessionId` are present the request uses
+ * session-sticky proxy allocation via `fetchWithSessionRetry`; otherwise
+ * the existing `fetchWithRetry` path is used (backward-compatible).
  */
 export async function handleAnthropicMessages(
 	body: unknown,
 	proxyPool?: ProxyPool,
+): Promise<Response>;
+export async function handleAnthropicMessages(
+	body: unknown,
+	proxyPool?: ProxyPool,
+	sessionPool?: SessionProxyPool,
+	sessionId?: string,
+): Promise<Response>;
+export async function handleAnthropicMessages(
+	body: unknown,
+	proxyPool?: ProxyPool,
+	sessionPool?: SessionProxyPool,
+	sessionId?: string,
 ): Promise<Response> {
 	// -- Input validation -------------------------------------------------------
 	const validationError = validateAnthropicRequest(body);
@@ -483,15 +503,16 @@ export async function handleAnthropicMessages(
 
 	const url = config.url;
 
-	// -- Execute (direct -> proxy fallback) with shared retry -------------------
-	const result = await fetchWithRetry(
-		url,
-		init,
-		proxyPool,
-		`anthropic:${req.model}`,
-	);
+	// -- Execute with session-aware or standard retry --------------------------
+	const result: FetchWithRetryResult =
+		sessionPool && sessionId
+			? await fetchWithSessionRetry(url, init, sessionPool, sessionId, `anthropic:${req.model}`)
+			: await fetchWithRetry(url, init, proxyPool, `anthropic:${req.model}`);
 
 	if (result.errorClassification) {
+		if (sessionPool && sessionId) {
+			sessionPool.release(sessionId);
+		}
 		return new Response(
 			JSON.stringify({
 				type: "error",
@@ -516,16 +537,20 @@ export async function handleAnthropicMessages(
 	if (!response.ok) {
 		const status = response.status;
 		const genericMsg = status >= 500 ? "Upstream server error" : "Upstream rejected request";
+		if (sessionPool && sessionId) {
+			sessionPool.release(sessionId);
+		}
 		return anthropicError(status, genericMsg, "upstream_error");
 	}
 
 	// -- Handle streaming -------------------------------------------------------
 	if (wantsStream) {
-		const transformed = transformAnthropicStream(
+		let transformed = transformAnthropicStream(
 			response.body!,
 			req.model,
 			config,
 		);
+		transformed = wrapAnthropicStreamMaybe(transformed, sessionPool, sessionId);
 		return new Response(transformed, {
 			status: 200,
 			headers: {
@@ -540,6 +565,9 @@ export async function handleAnthropicMessages(
 
 	// -- Handle non-streaming ---------------------------------------------------
 	const text = await response.text();
+	if (sessionPool && sessionId) {
+		sessionPool.release(sessionId);
+	}
 
 	if (text.trimStart().startsWith("data: ")) {
 		const accumulated = accumulateSSEText(text);
@@ -580,6 +608,50 @@ export async function handleAnthropicMessages(
 		headers: {
 			"Content-Type": "application/json",
 			"Access-Control-Allow-Origin": "*",
+		},
+	});
+}
+
+// --- Stream cleanup wrapper ----------------------------------------------------
+
+/**
+ * If a session is active, wrap the stream so the session is released on end/error.
+ * Otherwise pass through the stream unchanged.
+ */
+function wrapAnthropicStreamMaybe(
+	body: ReadableStream,
+	sessionPool?: SessionProxyPool,
+	sessionId?: string,
+): ReadableStream {
+	if (!sessionPool || !sessionId) return body;
+	return wrapAnthropicStreamWithCleanup(body, () => sessionPool.release(sessionId));
+}
+
+/**
+ * Wraps a ReadableStream and calls `cleanup` when the stream ends, errors,
+ * or is cancelled by the consumer.
+ */
+function wrapAnthropicStreamWithCleanup(body: ReadableStream, cleanup: () => void): ReadableStream {
+	const reader = body.getReader();
+
+	return new ReadableStream({
+		async pull(controller) {
+			try {
+				const { done, value } = await reader.read();
+				if (done) {
+					cleanup();
+					controller.close();
+					return;
+				}
+				controller.enqueue(value);
+			} catch (err) {
+				cleanup();
+				controller.error(err);
+			}
+		},
+		cancel(reason) {
+			cleanup();
+			reader.cancel(reason);
 		},
 	});
 }

@@ -5,7 +5,7 @@
  * error sanitization, and graceful shutdown tracking — all in one place.
  */
 
-import type { ProxyPool } from "./proxy-pool";
+import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
 
 // ─── Active stream tracking (for graceful shutdown) ───────────────────────
 
@@ -206,4 +206,79 @@ function classifyFetchErrorSafe(error: unknown): {
   }
 
   return { code: "NETWORK_ERROR", status: 502, message: "Upstream unreachable" };
+}
+
+// ─── Fetch with session-based proxy retry ────────────────────────────────
+
+/**
+ * Execute an upstream `fetch` using a session-sticky proxy with retry.
+ *
+ * Strategy: session-sticky proxy (via SessionProxyPool) on attempt 1; on
+ * failure the session's proxy is marked failed — which auto-rotates if the
+ * failure threshold is exceeded — and the request retries with the new proxy.
+ *
+ * SSE streams: the initial request is retried normally. Once the response body
+ * starts streaming, mid-stream errors are **not** retried; the session is
+ * released and the error is returned to the caller.
+ */
+export async function fetchWithSessionRetry(
+  url: string,
+  init: RequestInit & { proxy?: string },
+  sessionPool: SessionProxyPool | undefined,
+  sessionId: string,
+  context?: string,
+  maxRetries = 3,
+): Promise<FetchWithRetryResult> {
+  // Fallback when no session pool is available
+  if (!sessionPool) {
+    try {
+      const response = await fetch(url, init);
+      return { response };
+    } catch (err) {
+      return { errorClassification: classifyFetchErrorSafe(err) };
+    }
+  }
+
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const proxyUrl = sessionPool.getProxyUrl(sessionId);
+    if (proxyUrl) {
+      init.proxy = proxyUrl;
+    }
+
+    try {
+      const response = await fetch(url, init);
+
+      if (response.ok) {
+        sessionPool.markSuccess(sessionId);
+        return { response };
+      }
+
+      // Non-2xx — mark session failed and retry
+      lastError = new Error(`Upstream returned ${response.status}`);
+      const rotated = sessionPool.markFailed(sessionId);
+
+      const ctx = context ? `[${context}] ` : "";
+      console.warn(
+        `${ctx}fetchWithSessionRetry attempt ${attempt + 1}/${maxRetries} ` +
+          `failed with ${response.status}${rotated ? " (rotated proxy)" : ""}`,
+      );
+    } catch (err) {
+      lastError = err;
+      const rotated = sessionPool.markFailed(sessionId);
+
+      const ctx = context ? `[${context}] ` : "";
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `${ctx}fetchWithSessionRetry attempt ${attempt + 1}/${maxRetries} ` +
+          `failed: ${errMsg}${rotated ? " (rotated proxy)" : ""}`,
+      );
+    }
+  }
+
+  // All attempts exhausted — release session and classify last error
+  sessionPool.release(sessionId);
+  const err = lastError ?? new Error("All session proxy attempts failed");
+  return { errorClassification: classifyFetchErrorSafe(err) };
 }

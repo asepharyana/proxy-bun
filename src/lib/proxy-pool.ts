@@ -179,3 +179,200 @@ export class ProxyPool {
 		this.failureThreshold = n;
 	}
 }
+
+// --- SessionProxyPool ---------------------------------------------------------
+
+interface SessionInfo {
+	proxyIndex: number;
+	failures: number;
+}
+
+/**
+ * Session-based sticky proxy allocation on top of ProxyPool.
+ *
+ * Each session gets one sticky proxy until:
+ * - The session is released (cleanup)
+ * - The proxy exceeds the failure threshold (auto-rotate to next avail)
+ * - The session explicitly calls release()
+ *
+ * New sessions are assigned to the least-loaded proxy (fewest active sessions).
+ */
+export class SessionProxyPool {
+	private pool: ProxyPool;
+	private sessions = new Map<string, SessionInfo>();
+	/** proxyIndex -> set of session IDs currently using it */
+	private proxyUsage = new Map<number, Set<string>>();
+	private failureThreshold: number;
+
+	/**
+	 * @param poolOrPath Existing ProxyPool or file path to load from.
+	 */
+	constructor(poolOrPath?: ProxyPool | string) {
+		if (poolOrPath instanceof ProxyPool) {
+			this.pool = poolOrPath;
+		} else {
+			this.pool = new ProxyPool();
+			if (poolOrPath) this.pool.load(poolOrPath);
+		}
+		this.failureThreshold = 3;
+	}
+
+	/** Number of available proxies in the underlying pool. */
+	get size(): number {
+		return this.pool.size;
+	}
+
+	/** Number of active sessions. */
+	get activeSessions(): number {
+		return this.sessions.size;
+	}
+
+	// -- Session management -------------------------------------------------------
+
+	/**
+	 * Assign a sticky proxy to a session. Returns the proxy URL, or null if empty.
+	 *
+	 * If the session already has a proxy, returns the same one (resume).
+	 * Otherwise picks the least-loaded proxy.
+	 */
+	acquire(sessionId: string): string | null {
+		if (this.pool.size === 0) return null;
+
+		const existing = this.sessions.get(sessionId);
+		if (existing !== undefined) {
+			return this.formatProxyUrlAtIndex(existing.proxyIndex);
+		}
+
+		const index = this.pickLeastUsedIndex();
+		if (index === -1) return null;
+
+		this.sessions.set(sessionId, { proxyIndex: index, failures: 0 });
+
+		let usedBy = this.proxyUsage.get(index);
+		if (!usedBy) {
+			usedBy = new Set();
+			this.proxyUsage.set(index, usedBy);
+		}
+		usedBy.add(sessionId);
+
+		return this.formatProxyUrlAtIndex(index);
+	}
+
+	/** Return the current proxy URL for a session (no rotation), or null. */
+	getProxyUrl(sessionId: string): string | null {
+		const info = this.sessions.get(sessionId);
+		if (!info) return null;
+		return this.formatProxyUrlAtIndex(info.proxyIndex);
+	}
+
+	/** Remove a session from all tracking. */
+	release(sessionId: string): void {
+		const info = this.sessions.get(sessionId);
+		if (!info) return;
+
+		const usedBy = this.proxyUsage.get(info.proxyIndex);
+		if (usedBy) {
+			usedBy.delete(sessionId);
+			if (usedBy.size === 0) this.proxyUsage.delete(info.proxyIndex);
+		}
+
+		this.sessions.delete(sessionId);
+	}
+
+	/**
+	 * Increment failure count for this session's proxy.
+	 *
+	 * If failures >= threshold, auto-rotate to a different proxy.
+	 * Also marks the old proxy as failed in the underlying ProxyPool.
+	 *
+	 * @returns true if the session was rotated to a new proxy.
+	 */
+	markFailed(sessionId: string): boolean {
+		const info = this.sessions.get(sessionId);
+		if (!info) return false;
+
+		info.failures += 1;
+		if (info.failures < this.failureThreshold) return false;
+
+		const oldIndex = info.proxyIndex;
+
+		// Mark in underlying pool (public API only works on currentIndex)
+		const savedIdx = (this.pool as any).currentIndex as number;
+		(this.pool as any).currentIndex = oldIndex;
+		this.pool.markFailed(this.failureThreshold);
+		(this.pool as any).currentIndex = savedIdx;
+
+		// Remove session from old proxy usage tracking
+		const usedBy = this.proxyUsage.get(oldIndex);
+		if (usedBy) {
+			usedBy.delete(sessionId);
+			if (usedBy.size === 0) this.proxyUsage.delete(oldIndex);
+		}
+
+		// Pick next available proxy
+		const newIndex = this.pickLeastUsedIndex();
+		if (newIndex === -1 || newIndex === oldIndex) {
+			// Single-proxy pool or none available — reset failures, stay put
+			this.sessions.set(sessionId, { proxyIndex: oldIndex, failures: 0 });
+			return false;
+		}
+
+		this.sessions.set(sessionId, { proxyIndex: newIndex, failures: 0 });
+
+		let newUsedBy = this.proxyUsage.get(newIndex);
+		if (!newUsedBy) {
+			newUsedBy = new Set();
+			this.proxyUsage.set(newIndex, newUsedBy);
+		}
+		newUsedBy.add(sessionId);
+
+		return true;
+	}
+
+	/** Reset failure count for this session's proxy. */
+	markSuccess(sessionId: string): void {
+		const info = this.sessions.get(sessionId);
+		if (!info) return;
+		info.failures = 0;
+	}
+
+	// -- Internals ----------------------------------------------------------------
+
+	/** Get the ProxyEntry at a given index. Forward reference to local type. */
+	private poolEntryAtIndex(index: number): ProxyEntry | null {
+		return (this.pool as any).proxies[index] ?? null;
+	}
+
+	/** Build proxy URL string by index. */
+	private formatProxyUrlAtIndex(index: number): string | null {
+		const entry = this.poolEntryAtIndex(index);
+		if (!entry) return null;
+		const auth = entry.username
+			? `${encodeURIComponent(entry.username)}:${encodeURIComponent(entry.password)}@`
+			: "";
+		return `http://${auth}${entry.host}:${entry.port}`;
+	}
+
+	/** Return the index of the proxy with the fewest active sessions, or -1. */
+	private pickLeastUsedIndex(): number {
+		if (this.pool.size === 0) return -1;
+
+		let bestIndex = 0;
+		let bestCount = Infinity;
+
+		for (let i = 0; i < this.pool.size; i++) {
+			const count = this.proxyUsage.get(i)?.size ?? 0;
+			if (count < bestCount) {
+				bestCount = count;
+				bestIndex = i;
+			}
+		}
+
+		return bestIndex;
+	}
+
+	/** Override the failure threshold (default 3). */
+	setFailureThreshold(n: number): void {
+		this.failureThreshold = n;
+	}
+}
