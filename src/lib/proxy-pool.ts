@@ -361,6 +361,60 @@ export class SessionProxyPool {
 		return true;
 	}
 
+	/**
+	 * Force-rotate this session to the least-loaded proxy immediately,
+	 * regardless of failure count. Resets the session's failure counter.
+	 *
+	 * @returns true if the session was moved to a different proxy.
+	 */
+	rotateNow(sessionId: string): boolean {
+		const info = this.sessions.get(sessionId);
+		if (!info) return false;
+
+		const oldIndex = info.proxyIndex;
+		const oldEntry = this.poolEntryAtIndex(oldIndex);
+
+		// Remove from old proxy usage first
+		const usedBy = this.proxyUsage.get(oldIndex);
+		if (usedBy) {
+			usedBy.delete(sessionId);
+			if (usedBy.size === 0) this.proxyUsage.delete(oldIndex);
+		}
+
+		// Find the least-loaded proxy that is NOT the current one.
+		// Start scanning from (oldIndex + 1) so we don't immediately
+		// bounce back to index 0 when all usage counts are equal.
+		let bestIndex = -1;
+		let bestCount = Infinity;
+		for (let step = 1; step <= this.pool.size; step++) {
+			const i = (oldIndex + step) % this.pool.size;
+			const count = this.proxyUsage.get(i)?.size ?? 0;
+			if (count < bestCount) {
+				bestCount = count;
+				bestIndex = i;
+			}
+		}
+
+		if (bestIndex === -1) {
+			// Single-proxy pool — reinstate and give up
+			if (usedBy) usedBy.add(sessionId);
+			return false;
+		}
+
+		this.sessions.set(sessionId, { proxyIndex: bestIndex, failures: 0 });
+
+		let newUsedBy = this.proxyUsage.get(bestIndex);
+		if (!newUsedBy) {
+			newUsedBy = new Set();
+			this.proxyUsage.set(bestIndex, newUsedBy);
+		}
+		newUsedBy.add(sessionId);
+
+		const newEntry = this.poolEntryAtIndex(bestIndex);
+		logPool(`rotateNow session=${sessionId.slice(0, 8)} ${oldEntry?.host} -> ${newEntry?.host}`);
+		return true;
+	}
+
 	/** Reset failure count for this session's proxy. */
 	markSuccess(sessionId: string): void {
 		const info = this.sessions.get(sessionId);

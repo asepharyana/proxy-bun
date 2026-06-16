@@ -168,18 +168,18 @@ export async function fetchWithRetry(
         return { response };
       }
 
-      // Non-2xx — mark proxy as failed and retry
+      // Non-2xx — mark proxy as failed and rotate for next attempt
       lastError = new Error(`Upstream returned ${response.status}`);
       logProxy("fetchWithRetry", `non-2xx attempt=${attempt + 1} status=${response.status}`, { context });
       if (usedProxy && proxyPool && proxyPool.size > 0 && init.proxy) {
         proxyPool.markFailed();
-        usedProxy = false;
+        proxyPool.rotate();
       }
     } catch (err) {
       lastError = err;
       if (usedProxy && proxyPool && proxyPool.size > 0 && init.proxy) {
         proxyPool.markFailed();
-        usedProxy = false;
+        proxyPool.rotate();
       }
 
       // Log the actual error so operators can diagnose
@@ -190,16 +190,17 @@ export async function fetchWithRetry(
     }
   }
 
-  // All attempts exhausted — classify the last error
-  if (!response) {
-    const err = lastError ?? new Error("All connection attempts failed");
-    logProxy("fetchWithRetry", "exhausted all retries", { context });
-    return { errorClassification: classifyFetchErrorSafe(err) };
+  // All attempts exhausted
+  logProxy("fetchWithRetry", "exhausted all retries", { context, hadResponse: !!response });
+
+  // If we got at least one HTTP response, return it as-is so the caller
+  // can relay the proper status code (e.g. 429).
+  if (response) {
+    return { response };
   }
 
-  // Non-2xx but we have a response — pass it along (caller handles it)
-  logProxy("fetchWithRetry", `returning non-2xx response status=${response.status}`, { context });
-  return { response };
+  const err = lastError ?? new Error("All connection attempts failed");
+  return { errorClassification: classifyFetchErrorSafe(err) };
 }
 
 /**
@@ -270,6 +271,7 @@ export async function fetchWithSessionRetry(
   }
 
   let lastError: unknown;
+  let lastResponse: Response | undefined;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     // First attempt: acquire() assigns a proxy to this session (least-loaded
@@ -303,9 +305,10 @@ export async function fetchWithSessionRetry(
         return { response };
       }
 
-      // Non-2xx — mark session failed and retry
+      // Non-2xx — rotate proxy immediately for the next attempt
       lastError = new Error(`Upstream returned ${response.status}`);
-      const rotated = sessionPool.markFailed(sessionId);
+      lastResponse = response;
+      const rotated = sessionPool.rotateNow(sessionId);
       logProxy("fetchWithSessionRetry", `non-2xx attempt=${attempt + 1} status=${response.status} rotated=${rotated}`, {
         context,
         sessionId: sessionId.slice(0, 8),
@@ -319,7 +322,7 @@ export async function fetchWithSessionRetry(
       );
     } catch (err) {
       lastError = err;
-      const rotated = sessionPool.markFailed(sessionId);
+      const rotated = sessionPool.rotateNow(sessionId);
       const errMsg = err instanceof Error ? err.message : String(err);
       logProxy("fetchWithSessionRetry", `failed attempt=${attempt + 1} err=${errMsg} rotated=${rotated}`, {
         context,
@@ -335,12 +338,21 @@ export async function fetchWithSessionRetry(
     }
   }
 
-  // All attempts exhausted — release session and classify last error
-  logProxy("fetchWithSessionRetry", "exhausted all retries — releasing session", {
+  // All attempts exhausted
+  logProxy("fetchWithSessionRetry", "exhausted all retries", {
     context,
     sessionId: sessionId.slice(0, 8),
+    hadResponse: !!lastResponse,
   });
   sessionPool.release(sessionId);
+
+  // If we got at least one HTTP response (e.g. 429), return it so the caller
+  // can relay the proper status code.  Only classify as error on network
+  // failures where there's no response at all.
+  if (lastResponse) {
+    return { response: lastResponse };
+  }
+
   const err = lastError ?? new Error("All session proxy attempts failed");
   return { errorClassification: classifyFetchErrorSafe(err) };
 }
