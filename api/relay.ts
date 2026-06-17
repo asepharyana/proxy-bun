@@ -29,10 +29,7 @@ import { createRateLimiter } from "../src/middleware/rate-limiter";
 import { logRelayEvent } from "../src/middleware/logger";
 import { handleChatCompletion, listModels } from "../src/lib/ai-proxy";
 import { handleAnthropicMessages } from "../src/lib/anthropic-proxy";
-
-// Read test-api.html at module scope so Bun's bundler inlines the content
-// at build time (Vercel serverless has no filesystem at runtime).
-const testApiHtmlRaw = await Bun.file("public/test-api.html").text();
+import testApiHtmlRaw from "./test-api-content";
 
 // ─── Configuration ──────────────────────────────────────────────────────────────
 
