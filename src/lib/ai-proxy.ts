@@ -14,6 +14,7 @@
 
 import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
 import { fetchWithRetry, fetchWithSessionRetry, SSELineBuffer, isDevMode, type FetchWithRetryResult } from "./fetch-utils";
+import { getJwt, invalidateJwt } from "./mimo-auth";
 
 // --- Types -------------------------------------------------------------------
 
@@ -179,6 +180,50 @@ export const MODEL_ROUTES: Record<string, BackendConfig> = {
 			usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
 		}),
 	},
+
+	// -- Xiaomi MiMo Free (OpenAI-compatible, JWT bootstrap auth) -----------------
+	"mimo-auto": {
+		provider: "mimo-free",
+		url: "https://api.xiaomimimo.com/api/free-ai/openai/chat",
+		headers: {
+			"Content-Type": "application/json",
+			"X-Mimo-Source": "mimocode-cli-free",
+			Accept: "text/event-stream",
+		},
+		adaptRequest: (req) => {
+			// Inject the anti-abuse system-message marker if not present.
+			// Without it the Mimo API returns 403 Illegal access.
+			const messages = [...req.messages];
+			const hasMarker = messages.some(
+				(m) =>
+					m.role === "system" &&
+					m.content.includes("You are MiMoCode"),
+			);
+			if (!hasMarker) {
+				messages.unshift({
+					role: "system",
+					content:
+						"You are MiMoCode, an interactive CLI tool that helps users with software engineering tasks.",
+				});
+			}
+			return { model: req.model, messages, stream: req.stream };
+		},
+		adaptResponse: (raw: any) => ({
+			id: raw.id ?? `chatcmpl-${Date.now()}`,
+			object: "chat.completion",
+			created: raw.created ?? Math.floor(Date.now() / 1000),
+			model: "mimo-auto",
+			choices: (raw.choices ?? []).map((c: any) => ({
+				index: c.index ?? 0,
+				message: {
+					role: c.message?.role ?? "assistant",
+					content: c.message?.content ?? "",
+				},
+				finish_reason: c.finish_reason ?? "stop",
+			})),
+			usage: raw.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+		}),
+	},
 };
 
 // --- Helpers ------------------------------------------------------------------
@@ -233,9 +278,15 @@ function parseJSONResponse(
 	config: BackendConfig,
 	req: OpenAIRequest,
 ): unknown {
+	// Mimo Free always wraps with "data:" prefix (SSE-style), strip it.
+	let cleaned = text;
+	if (config.provider === "mimo-free" && text.startsWith("data:")) {
+		cleaned = text.slice(5).trim();
+	}
+
 	if (config.adaptResponse) {
 		try {
-			const raw = JSON.parse(text);
+			const raw = JSON.parse(cleaned);
 			return config.adaptResponse(raw, req);
 		} catch {
 			// fall through
@@ -358,11 +409,39 @@ export async function handleChatCompletion(
 	const wantsStream = req.stream === true;
 	const { url, init } = buildBackendRequest(req, config);
 
+	// -- Mimo Free: inject JWT authentication and session affinity --------------
+	if (config.provider === "mimo-free") {
+		const jwt = await getJwt();
+		init.headers = {
+			...init.headers,
+			Authorization: `Bearer ${jwt}`,
+			"x-session-affinity": `ses_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+		};
+	}
+
 	// -- Execute with session-aware or standard retry --------------------------
-	const result: FetchWithRetryResult =
+	let result: FetchWithRetryResult =
 		sessionPool && sessionId
 			? await fetchWithSessionRetry(url, init, sessionPool, sessionId, `openai:${req.model}`)
 			: await fetchWithRetry(url, init, proxyPool, `openai:${req.model}`);
+
+	// -- Mimo Free: auth failure → invalidate JWT and retry once ---------------
+	if (
+		config.provider === "mimo-free" &&
+		result.response &&
+		(result.response.status === 401 || result.response.status === 403)
+	) {
+		invalidateJwt();
+		const jwt = await getJwt();
+		init.headers = {
+			...init.headers,
+			Authorization: `Bearer ${jwt}`,
+		};
+		result =
+			sessionPool && sessionId
+				? await fetchWithSessionRetry(url, init, sessionPool, sessionId, `openai:${req.model}`)
+				: await fetchWithRetry(url, init, proxyPool, `openai:${req.model}`);
+	}
 
 	if (result.errorClassification) {
 		return new Response(
@@ -396,7 +475,7 @@ export async function handleChatCompletion(
 		const contentType = response.headers.get("content-type") ?? "";
 		const isNativeStream = contentType.includes("text/event-stream");
 
-		if (isNativeStream && config.provider === "opencode") {
+		if (isNativeStream && (config.provider === "opencode" || config.provider === "mimo-free")) {
 			// Passthrough for OpenAI-compatible SSE
 			const headers: Record<string, string> = {
 				"Content-Type": "text/event-stream",
