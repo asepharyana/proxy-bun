@@ -29,6 +29,7 @@ import { createRateLimiter } from "../src/middleware/rate-limiter";
 import { logRelayEvent } from "../src/middleware/logger";
 import { handleChatCompletion, listModels } from "../src/lib/ai-proxy";
 import { handleAnthropicMessages } from "../src/lib/anthropic-proxy";
+import testApiHtml from "../public/test-api.html";
 
 // ─── Configuration ──────────────────────────────────────────────────────────────
 
@@ -380,7 +381,11 @@ export default {
 
 		// Static routes — show index only when no relay target is requested
 		if (url.pathname === "/health") return handleHealth();
-		if (url.pathname === "/docs") return handleDocs();
+		if (url.pathname === "/docs" || url.pathname === "/test") {
+			return new Response(testApiHtml, {
+				headers: { "Content-Type": "text/html; charset=utf-8" },
+			});
+		}
 		if (
 			url.pathname === "/" &&
 			req.method === "GET" &&
