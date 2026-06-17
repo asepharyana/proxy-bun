@@ -29,7 +29,7 @@ import { createRateLimiter } from "../src/middleware/rate-limiter";
 import { logRelayEvent } from "../src/middleware/logger";
 import { handleChatCompletion, listModels } from "../src/lib/ai-proxy";
 import { handleAnthropicMessages } from "../src/lib/anthropic-proxy";
-import testApiHtml from "../public/test-api.html";
+import testApiHtml from "../public/test-api.html" with { type: "text" };
 
 // ─── Configuration ──────────────────────────────────────────────────────────────
 
