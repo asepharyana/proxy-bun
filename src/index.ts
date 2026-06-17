@@ -465,8 +465,7 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 
 		// Static routes
 		if (url.pathname === "/health") return handleHealth();
-		if (url.pathname === "/docs") return handleDocs();
-		if (url.pathname === "/test") {
+		if (url.pathname === "/docs" || url.pathname === "/test") {
 			const file = Bun.file("public/test-api.html");
 			const exists = await file.exists();
 			return new Response(exists ? file : "Not found", {
