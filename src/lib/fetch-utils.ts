@@ -133,7 +133,7 @@ export interface FetchWithRetryResult {
 /**
  * Execute an upstream `fetch` with automatic retry and proxy rotation.
  *
- * Strategy: proxy pool on every attempt (rotate each retry).
+ * Strategy: direct connection first, then fall back to proxies.
  * Falls back to direct when no pool is available.
  * Logs every failure to `console.warn` so the operator can diagnose without
  * the error body leaking to the downstream client.
@@ -148,24 +148,31 @@ export async function fetchWithRetry(
   let lastError: unknown;
   let usedProxy = false;
 
-  // Calculate max attempts: pool.size proxies + 1 direct fallback, min 3
+  // Strategy: direct first, then proxies as fallback.
+  // maxAttempts = 1 direct + pool.size proxies, min 3 (all direct if no pool).
   const poolSize = proxyPool?.size ?? 0;
   const maxAttempts = poolSize > 0 ? poolSize + 1 : 3;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    if (proxyPool && proxyPool.size > 0 && attempt < poolSize) {
-      // Use proxy from pool — first attempt gets current, rest rotate
-      if (attempt === 0) {
+    if (attempt === 0) {
+      // First attempt — direct (no proxy)
+      init.proxy = undefined;
+      usedProxy = false;
+    } else if (proxyPool && proxyPool.size > 0) {
+      // Fallback — try a proxy from the pool
+      if (attempt === 1) {
+        // Second attempt — start with current proxy
         init.proxy = proxyPool.getProxyUrl()!;
         usedProxy = true;
       } else {
+        // Later attempts — rotate to a different proxy
         const next = proxyPool.rotate(extractModel(context));
         if (!next) break;
         init.proxy = proxyPool.getProxyUrl()!;
         usedProxy = true;
       }
     } else {
-      // Last resort — direct (no proxy)
+      // No proxy pool, retry direct
       init.proxy = undefined;
       usedProxy = false;
     }
@@ -261,9 +268,9 @@ function classifyFetchErrorSafe(error: unknown): {
 /**
  * Execute an upstream `fetch` using a session-sticky proxy with retry.
  *
- * Strategy: acquire() on attempt 0 (least-loaded assignment), then
- * getProxyUrl() on subsequent attempts (reads the existing or rotated proxy).
- * On persistent failure the session's proxy is marked failed — which
+ * Strategy: direct connection first, then acquire() on attempt 1 (least-loaded
+ * assignment), then getProxyUrl() on subsequent attempts (reads the existing or
+ * rotated proxy). On persistent failure the session's proxy is marked failed — which
  * auto-rotates if the failure threshold is exceeded — and the request
  * retries with the new proxy.
  *
@@ -290,30 +297,27 @@ export async function fetchWithSessionRetry(
     }
   }
 
-  // Exhaust all proxies + 1 direct fallback
-  const totalAttempts = maxRetries ?? sessionPool.size + 1;
+  // Strategy: direct first, then session-sticky proxies as fallback.
+  // totalAttempts = 1 direct + sessionPool.size proxies, min 3.
+  const totalAttempts = maxRetries ?? Math.max(3, sessionPool.size + 1);
   let lastError: unknown;
   let lastResponse: Response | undefined;
-  let triedDirect = false;
-
   for (let attempt = 0; attempt < totalAttempts; attempt++) {
     // Determine proxy for this attempt
-    if (attempt < sessionPool.size) {
-      // Use session-sticky proxy
-      const proxyUrl = attempt === 0
+    if (attempt === 0) {
+      // First attempt — direct (no proxy)
+      init.proxy = undefined;
+    } else if (sessionPool.size > 0) {
+      // Fallback — use session-sticky proxy
+      const proxyUrl = attempt === 1
         ? sessionPool.acquire(sessionId)
         : sessionPool.getProxyUrl(sessionId);
       if (proxyUrl) {
         init.proxy = proxyUrl;
       }
-      triedDirect = false;
-    } else if (!triedDirect) {
-      // Last resort — direct (no proxy)
-      init.proxy = undefined;
-      triedDirect = true;
     } else {
-      // Already tried direct, exhausted everything
-      break;
+      // No proxy pool, retry direct
+      init.proxy = undefined;
     }
 
     const proxyShort = init.proxy
