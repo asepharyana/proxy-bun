@@ -38,7 +38,6 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest
             type=sha,prefix=
 
       - name: Build and push Docker image
@@ -54,4 +53,4 @@ jobs:
         with:
           token: ${{ secrets.DEPLOY_TOKEN }}
           event-type: deploy
-          client-payload: '{"image_tag": "${{ github.sha }}"}'
+          client-payload: '{"image_tag": "${{ steps.meta.outputs.version }}"}'
