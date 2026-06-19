@@ -28,14 +28,12 @@ export function closeAllActiveReaders(): void {
 /**
  * Returns `true` when development features (HMR, verbose console) should
  * be enabled.  Controlled by the `NODE_ENV` / `BUN_ENV` env var — defaults
- * to `true` for convenience during local development.
- *
- * Set `NODE_ENV=production` or `BUN_ENV=production` to disable.
+ * to `false` (production-safe).  Set `NODE_ENV=development` to enable.
  */
 export function isDevMode(): boolean {
   const env = (process.env.NODE_ENV ?? process.env.BUN_ENV ?? "").toLowerCase();
-  if (env === "production") return false;
-  return true;
+  if (env === "development" || env === "dev") return true;
+  return false;
 }
 
 // ─── SSE line buffer (fixes chunk-boundary corruption) ───────────────────
@@ -51,6 +49,7 @@ export function isDevMode(): boolean {
  */
 export class SSELineBuffer {
   private buffer = "";
+  private readonly MAX_BUFFER_SIZE = 1024 * 1024; // 1MB limit to prevent OOM
 
   /**
    * Feed a chunk of decoded text and return complete lines.
@@ -58,6 +57,11 @@ export class SSELineBuffer {
    */
   add(chunk: string): string[] {
     this.buffer += chunk;
+    
+    if (this.buffer.length > this.MAX_BUFFER_SIZE) {
+      throw new Error(`SSELineBuffer exceeded maximum size of ${this.MAX_BUFFER_SIZE} bytes. Stream may be malicious or corrupted.`);
+    }
+
     if (!this.buffer.includes("\n")) return [];
 
     const parts = this.buffer.split("\n");

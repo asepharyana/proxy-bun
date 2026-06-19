@@ -11,11 +11,16 @@
 export interface RateLimiterOptions {
 	maxRequests?: number;
 	windowMs?: number;
+	/** Optional async KV store for distributed rate limiting */
+	kv?: {
+		get(key: string): Promise<number[] | null>;
+		set(key: string, value: number[], expirationTtl?: number): Promise<void>;
+	};
 }
 
 export interface RateLimiter {
-	check(key: string): { allowed: boolean; retryAfterMs?: number };
-	reset(key: string): void;
+	checkAsync(key: string): Promise<{ allowed: boolean; retryAfterMs?: number }>;
+	resetAsync(key: string): Promise<void>;
 }
 
 const DEFAULT_MAX_REQUESTS = 100;
@@ -25,17 +30,17 @@ const CLEANUP_INTERVAL_DIVISOR = 10;
 export function createRateLimiter(options?: RateLimiterOptions): RateLimiter {
 	const maxRequests = options?.maxRequests ?? DEFAULT_MAX_REQUESTS;
 	const windowMs = options?.windowMs ?? DEFAULT_WINDOW_MS;
+	const kv = options?.kv;
 
-	// Map of key -> sorted array of timestamps (ascending)
+	// In-memory store fallback
 	const store = new Map<string, number[]>();
+
+	// Maximum number of unique keys to track (prevents unbounded memory growth)
+	const MAX_STORE_KEYS = 10_000;
 
 	// ── helpers ──────────────────────────────────────────────────────
 
-	/** Remove timestamps outside the sliding window. Returns the pruned slice. */
-	function prune(key: string, now: number): number[] {
-		const timestamps = store.get(key);
-		if (!timestamps) return [];
-
+	function pruneTimestamps(timestamps: number[], now: number): number[] {
 		const cutoff = now - windowMs;
 		const result: number[] = [];
 		for (let i = 0; i < timestamps.length; i++) {
@@ -43,17 +48,12 @@ export function createRateLimiter(options?: RateLimiterOptions): RateLimiter {
 				result.push(timestamps[i]);
 			}
 		}
-
-		if (result.length === 0) {
-			store.delete(key);
-		} else {
-			store.set(key, result);
-		}
 		return result;
 	}
 
-	/** Periodically sweep the entire store to free memory. */
+	/** Periodically sweep the entire memory store to free memory. */
 	function periodicCleanup(): void {
+		if (kv) return; // Cleanup handled by TTL in KV
 		const now = Date.now();
 		const cutoff = now - windowMs;
 
@@ -70,30 +70,67 @@ export function createRateLimiter(options?: RateLimiterOptions): RateLimiter {
 				store.set(key, pruned);
 			}
 		}
+
+		// If store still exceeds max keys after pruning, evict oldest entries
+		if (store.size > MAX_STORE_KEYS) {
+			// Sort by oldest timestamp, evict excess
+			const entries = Array.from(store.entries())
+				.sort((a, b) => {
+					const aOldest = a[1][0] ?? 0;
+					const bOldest = b[1][0] ?? 0;
+					return aOldest - bOldest;
+				});
+			const toEvict = entries.length - MAX_STORE_KEYS;
+			for (let i = 0; i < toEvict; i++) {
+				store.delete(entries[i]![0]);
+			}
+			console.warn(`[rate-limiter] Evicted ${toEvict} keys from store (max ${MAX_STORE_KEYS})`);
+		}
 	}
 
-	// Schedule periodic cleanup (every windowMs / 10)
-	const cleanupHandle = setInterval(
-		periodicCleanup,
-		windowMs / CLEANUP_INTERVAL_DIVISOR,
-	);
-	// Allow the process to exit even if the interval is still active
-	if (
-		cleanupHandle &&
-		typeof cleanupHandle === "object" &&
-		"unref" in cleanupHandle
-	) {
-		(cleanupHandle as NodeJS.Timeout).unref();
+	if (!kv) {
+		// Schedule periodic cleanup (every windowMs / 10)
+		const cleanupHandle = setInterval(
+			periodicCleanup,
+			windowMs / CLEANUP_INTERVAL_DIVISOR,
+		);
+		// Allow the process to exit even if the interval is still active
+		if (
+			cleanupHandle &&
+			typeof cleanupHandle === "object" &&
+			"unref" in cleanupHandle
+		) {
+			(cleanupHandle as NodeJS.Timeout).unref();
+		}
 	}
 
 	// ── public API ───────────────────────────────────────────────────
 
 	return {
-		check(key: string): { allowed: boolean; retryAfterMs?: number } {
+		async checkAsync(key: string): Promise<{ allowed: boolean; retryAfterMs?: number }> {
 			const now = Date.now();
-			const timestamps = prune(key, now);
+			let timestamps: number[] = [];
+
+			if (kv) {
+				try {
+					const val = await kv.get(key);
+					if (val) timestamps = val;
+				} catch {
+					// Fallback to empty
+				}
+			} else {
+				timestamps = store.get(key) ?? [];
+			}
+
+			timestamps = pruneTimestamps(timestamps, now);
 			timestamps.push(now);
-			store.set(key, timestamps);
+
+			if (kv) {
+				// We set TTL slightly higher than windowMs so it cleans up automatically
+				await kv.set(key, timestamps, Math.ceil(windowMs / 1000) + 10).catch(() => {});
+			} else {
+				store.set(key, timestamps);
+			}
 
 			if (timestamps.length <= maxRequests) {
 				return { allowed: true };
@@ -110,8 +147,12 @@ export function createRateLimiter(options?: RateLimiterOptions): RateLimiter {
 			return { allowed: false, retryAfterMs };
 		},
 
-		reset(key: string): void {
-			store.delete(key);
+		async resetAsync(key: string): Promise<void> {
+			if (kv) {
+				await kv.set(key, [], 1).catch(() => {});
+			} else {
+				store.delete(key);
+			}
 		},
 	};
 }

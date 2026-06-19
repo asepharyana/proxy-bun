@@ -29,8 +29,10 @@ const EXPIRY_BUFFER_MS = 300_000; // 5 minutes
  *
  * Format: `sha256(hostname|platform|arch|cpu|username)`
  * This matches the 9Router reference implementation.
+ *
+ * Uses Web Crypto API (available in Bun, Workers, and Node.js 20+).
  */
-function generateDeviceFingerprint(): string {
+async function generateDeviceFingerprint(): Promise<string> {
   const hostname = os.hostname();
   const platform = process.platform;
   const arch = process.arch;
@@ -39,9 +41,11 @@ function generateDeviceFingerprint(): string {
   const username = process.env.USER ?? process.env.USERNAME ?? "unknown";
 
   const raw = `${hostname}|${platform}|${arch}|${cpuModel}|${username}`;
-  const hasher = new Bun.CryptoHasher("sha256");
-  hasher.update(raw);
-  return hasher.digest("hex") as string;
+  const encoder = new TextEncoder();
+  const data = encoder.encode(raw);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const hashArray = new Uint8Array(hashBuffer);
+  return Array.from(hashArray).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 // --- JWT bootstrap -----------------------------------------------------------
@@ -55,7 +59,7 @@ function generateDeviceFingerprint(): string {
  * @throws If the bootstrap request fails or returns an unexpected response.
  */
 async function bootstrapJwt(): Promise<string> {
-  const fingerprint = generateDeviceFingerprint();
+  const fingerprint = await generateDeviceFingerprint();
 
   const resp = await fetch(MIMO_BOOTSTRAP_URL, {
     method: "POST",

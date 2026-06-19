@@ -692,7 +692,7 @@ describe("createErrorResponse", () => {
 		});
 		expect(result.status).toBe(504);
 		expect(result.headers.get("Content-Type")).toBe("application/json");
-		const body = await result.json();
+		const body = await result.json() as Record<string, unknown>;
 		expect(body.error).toBe(true);
 		expect(body.code).toBe("TIMEOUT");
 		expect(body.message).toBe("Upstream timed out");
@@ -714,7 +714,7 @@ describe("createErrorResponse", () => {
 			message: "DNS resolution failed",
 		});
 		expect(result.status).toBe(502);
-		const body = await result.json();
+		const body = await result.json() as Record<string, unknown>;
 		expect(body.code).toBe("DNS_FAILURE");
 	});
 });
@@ -849,7 +849,7 @@ describe("integration: full relay flow", () => {
 		const classified = classifyFetchError(error);
 		const response = createErrorResponse(classified);
 		expect(response.status).toBe(504);
-		const body = await response.json();
+		const body = await response.json() as Record<string, unknown>;
 		expect(body.code).toBe("TIMEOUT");
 		expect(body.error).toBe(true);
 	});

@@ -84,8 +84,8 @@ function getClientIP(req: Request): string {
 
 // --- Auth Helper ---------------------------------------------------------------
 
-function requireAuth(req: Request): Response | null {
-	const apiKey = process.env.API_KEY ?? "sk-dummy-key";
+function requireAuth(req: Request, env: Env): Response | null {
+	const apiKey = env.API_KEY ?? "sk-dummy-key";
 	const header = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? "";
 	const key = header.replace(/^Bearer\s+/i, "").trim();
 	if (key === apiKey) return null;
@@ -268,7 +268,7 @@ async function handleRelay(req: Request, env: Env): Promise<Response> {
 	}
 
 	// -- Middleware: Rate limiting ---------------------------------------------
-	const rateCheck = limiter.check(clientIP);
+	const rateCheck = await limiter.checkAsync(clientIP);
 	if (!rateCheck.allowed) {
 		logRelayEvent({
 			method,
@@ -387,12 +387,20 @@ export default {
 
 		if (url.pathname === "/health") return handleHealth();
 		if (url.pathname === "/docs" || url.pathname === "/test") {
-			const file = Bun.file("public/test-api.html");
-			const exists = await file.exists();
-			return new Response(exists ? file : "Not found", {
-				status: exists ? 200 : 404,
-				headers: { "Content-Type": "text/html; charset=utf-8" },
-			});
+			try {
+				const file = Bun.file("public/test-api.html");
+				const exists = await file.exists();
+				return new Response(exists ? file : "Not found", {
+					status: exists ? 200 : 404,
+					headers: { "Content-Type": "text/html; charset=utf-8" },
+				});
+			} catch {
+				// Bun.file not available in non-Bun runtimes (e.g. Workers)
+				return new Response("Not found", {
+					status: 404,
+					headers: { "Content-Type": "text/html; charset=utf-8" },
+				});
+			}
 		}
 		if (
 			url.pathname === "/" &&
@@ -425,7 +433,7 @@ export default {
 		if (url.pathname === "/v1/chat/completions") {
 			if (req.method === "OPTIONS") return createCorsPreflightResponse();
 			if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
-			const authErr = requireAuth(req);
+			const authErr = requireAuth(req, env);
 			if (authErr) return authErr;
 			try {
 				const body = await req.json();
@@ -441,7 +449,7 @@ export default {
 		if (url.pathname === "/v1/messages") {
 			if (req.method === "OPTIONS") return createCorsPreflightResponse();
 			if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
-			const authErr = requireAuth(req);
+			const authErr = requireAuth(req, env);
 			if (authErr) return authErr;
 			try {
 				const body = await req.json();
@@ -455,7 +463,7 @@ export default {
 		}
 
 		if (url.pathname === "/v1/models" && req.method === "GET") {
-			const authErr = requireAuth(req);
+			const authErr = requireAuth(req, env);
 			if (authErr) return authErr;
 			const models = listModels().map((id) => ({
 				id,

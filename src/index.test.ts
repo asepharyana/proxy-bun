@@ -25,7 +25,7 @@ describe("handleHealth", () => {
 
 	test("should include status, uptime, and version fields", async () => {
 		const response = handleHealth();
-		const body = await response.json();
+		const body = await response.json() as Record<string, unknown>;
 		expect(body.status).toBe("ok");
 		expect(typeof body.uptime).toBe("number");
 		expect(body.version).toBe("1.0.0");

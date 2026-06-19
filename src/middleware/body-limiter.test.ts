@@ -80,7 +80,7 @@ describe("body-limiter", () => {
 				headers: { "Content-Length": "200" },
 			});
 			const result = checkBodySize(request);
-			const body = await result!.json();
+			const body = await result!.json() as Record<string, unknown>;
 			expect(body.error).toBe("Payload Too Large");
 			expect(body.maxSizeBytes).toBe(100);
 		});

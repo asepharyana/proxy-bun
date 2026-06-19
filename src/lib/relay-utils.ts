@@ -29,6 +29,23 @@ export class RelayError extends Error {
 	}
 }
 
+// --- SSRF DNS check configuration ---------------------------------------------
+
+/**
+ * When true, the relay path will resolve DNS and verify no resolved IP is
+ * private/link-local. This protects against DNS rebinding attacks but adds
+ * latency (DNS lookup per request). Enable via SSRF_DNS_CHECK=true env var.
+ */
+let ssrfDnsCheckEnabled = false;
+
+export function setSsrfDnsCheck(enabled: boolean): void {
+	ssrfDnsCheckEnabled = enabled;
+}
+
+export function isSsrfDnsCheckEnabled(): boolean {
+	return ssrfDnsCheckEnabled;
+}
+
 // --- CORS configuration -------------------------------------------------------
 
 /** Return CORS headers. Origin defaults to "*" but can be overridden via env. */
@@ -39,20 +56,27 @@ export function getAllowedOrigin(): string {
 }
 
 let cachedCorsHeaders: Record<string, string> | null = null;
+let cachedCorsOrigin: string | null = null;
 
 /** Rebuild the CORS headers map (call after changing origin at runtime). */
 export function rebuildCorsHeaders(): Record<string, string> {
+	const origin = getAllowedOrigin();
 	cachedCorsHeaders = {
-		"Access-Control-Allow-Origin": getAllowedOrigin(),
+		"Access-Control-Allow-Origin": origin,
 		"Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
 		"Access-Control-Allow-Headers": "*",
 	};
+	cachedCorsOrigin = origin;
 	return cachedCorsHeaders;
 }
 
-/** Return CORS headers with the configured origin (cached after first call). */
+/** Return CORS headers with the configured origin (cached, auto-invalidates on env change). */
 export function getCorsHeaders(): Record<string, string> {
-	if (!cachedCorsHeaders) rebuildCorsHeaders();
+	const currentOrigin = getAllowedOrigin();
+	// Invalidate cache if CORS_ORIGIN env changed
+	if (!cachedCorsHeaders || cachedCorsOrigin !== currentOrigin) {
+		rebuildCorsHeaders();
+	}
 	return cachedCorsHeaders!;
 }
 

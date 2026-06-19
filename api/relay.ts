@@ -252,7 +252,7 @@ async function handleRelay(req: Request): Promise<Response> {
 	}
 
 	// ── Middleware: Rate limiting ────────────────────────────────────
-	const rateCheck = rateLimiter.check(clientIP);
+	const rateCheck = await rateLimiter.checkAsync(clientIP);
 	if (!rateCheck.allowed) {
 		logRelayEvent({
 			method,

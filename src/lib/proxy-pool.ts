@@ -59,6 +59,45 @@ export class ProxyPool {
 		}
 
 		const text = readFileSync(filePath, "utf-8");
+		this.parseProxies(text, filePath);
+	}
+
+	/**
+	 * Async load proxies from a file at `filePath`.
+	 * Uses Bun.file() when available, falls back to sync read.
+	 */
+	async loadAsync(filePath: string): Promise<void> {
+		try {
+			// Try Bun.file first (Bun runtime)
+			if (typeof globalThis.Bun !== "undefined") {
+				const file = (globalThis as any).Bun.file(filePath);
+				const exists = await file.exists();
+				if (!exists) {
+					console.warn(`[proxy-pool] File not found: ${filePath}`);
+					return;
+				}
+				const text = await file.text();
+				this.parseProxies(text, filePath);
+				return;
+			}
+		} catch {
+			// Fall through to sync
+		}
+		// Fallback to sync read
+		this.load(filePath);
+	}
+
+	/**
+	 * Load proxies from a comma-separated string (for serverless envs).
+	 * Format: "host1:port1:user1:pass1,host2:port2:user2:pass2"
+	 */
+	loadFromString(proxyList: string): void {
+		if (!proxyList) return;
+		const lines = proxyList.split(",").map((l) => l.trim()).filter(Boolean);
+		this.parseProxies(lines.join("\n"), "env:PROXY_LIST");
+	}
+
+	private parseProxies(text: string, source: string): void {
 		const lines = text
 			.split("\n")
 			.map((l: string) => l.trim())
@@ -87,7 +126,7 @@ export class ProxyPool {
 		this.currentIndex = 0;
 		this.failures.clear();
 
-		logPool(`loaded ${this.proxies.length} proxies from ${filePath}`);
+		logPool(`loaded ${this.proxies.length} proxies from ${source}`);
 	}
 
 	/**
@@ -96,6 +135,14 @@ export class ProxyPool {
 	 */
 	tryLoad(filePath?: string): boolean {
 		if (filePath) this.load(filePath);
+		return this.proxies.length > 0;
+	}
+
+	/**
+	 * Async convenience -- load from a path or skip.
+	 */
+	async tryLoadAsync(filePath?: string): Promise<boolean> {
+		if (filePath) await this.loadAsync(filePath);
 		return this.proxies.length > 0;
 	}
 
@@ -135,6 +182,54 @@ export class ProxyPool {
 			? `${encodeURIComponent(entry.username)}:${encodeURIComponent(entry.password)}@`
 			: "";
 		return `http://${auth}${entry.host}:${entry.port}`;
+	}
+
+	// -- Manual proxy management ------------------------------------------------
+
+	/**
+	 * Add a single proxy to the pool.
+	 * Format: "host:port:username:password" (username:password optional)
+	 */
+	addProxy(proxyStr: string): void {
+		const parts = proxyStr.trim().split(":");
+		if (parts.length < 2) return;
+
+		const host = parts[0]!;
+		const port = Number.parseInt(parts[1]!, 10);
+		if (!Number.isFinite(port)) return;
+
+		this.proxies.push({
+			host,
+			port,
+			username: parts[2] ?? "",
+			password: parts.slice(3).join(":") ?? "",
+		});
+
+		logPool(`added proxy ${host}:${port} (total: ${this.proxies.length})`);
+	}
+
+	// -- Public accessors (for SessionProxyPool) --------------------------------
+
+	/** Get the ProxyEntry at a given index. Returns null if out of bounds. */
+	getEntryAtIndex(index: number): ProxyEntry | null {
+		return this.proxies[index] ?? null;
+	}
+
+	/** Build proxy URL string by index. Returns null if out of bounds. */
+	getProxyUrlAtIndex(index: number): string | null {
+		const entry = this.getEntryAtIndex(index);
+		if (!entry) return null;
+		return this.formatProxyUrl(entry);
+	}
+
+	/** Get the current rotation index. */
+	getCurrentIndex(): number {
+		return this.currentIndex;
+	}
+
+	/** Set the rotation index (for session pool's direct manipulation). */
+	setCurrentIndex(index: number): void {
+		this.currentIndex = index;
 	}
 
 	// -- Rotation ----------------------------------------------------------------
@@ -342,7 +437,7 @@ export class SessionProxyPool {
 		const existing = this.sessions.get(sessionId);
 		if (existing !== undefined) {
 			logPool(`acquire existing session=${sessionId.slice(0, 8)} proxyIndex=${existing.proxyIndex}`);
-			return this.formatProxyUrlAtIndex(existing.proxyIndex);
+			return this.pool.getProxyUrlAtIndex(existing.proxyIndex);
 		}
 
 		const index = this.pickLeastUsedIndex(model);
@@ -357,18 +452,18 @@ export class SessionProxyPool {
 		}
 		usedBy.add(sessionId);
 
-		const entry = this.poolEntryAtIndex(index);
+		const entry = this.pool.getEntryAtIndex(index);
 		logPool(`acquire session=${sessionId.slice(0, 8)} -> proxyIndex=${index} host=${entry?.host} activeSessions=${this.activeSessions}`);
-		return this.formatProxyUrlAtIndex(index);
+		return this.pool.getProxyUrlAtIndex(index);
 	}
 
 	/** Return the current proxy URL for a session (no rotation), or null. */
 	getProxyUrl(sessionId: string): string | null {
 		const info = this.sessions.get(sessionId);
 		if (!info) return null;
-		const entry = this.poolEntryAtIndex(info.proxyIndex);
+		const entry = this.pool.getEntryAtIndex(info.proxyIndex);
 		logPool(`getProxyUrl session=${sessionId.slice(0, 8)} proxyIndex=${info.proxyIndex} host=${entry?.host}`);
-		return this.formatProxyUrlAtIndex(info.proxyIndex);
+		return this.pool.getProxyUrlAtIndex(info.proxyIndex);
 	}
 
 	/** Remove a session from all tracking. */
@@ -383,7 +478,7 @@ export class SessionProxyPool {
 		}
 
 		this.sessions.delete(sessionId);
-		const entry = this.poolEntryAtIndex(info.proxyIndex);
+		const entry = this.pool.getEntryAtIndex(info.proxyIndex);
 		logPool(`release session=${sessionId.slice(0, 8)} proxyIndex=${info.proxyIndex} host=${entry?.host} activeSessions=${this.activeSessions}`);
 	}
 
@@ -405,13 +500,13 @@ export class SessionProxyPool {
 		if (info.failures < this.failureThreshold) return false;
 
 		const oldIndex = info.proxyIndex;
-		const oldEntry = this.poolEntryAtIndex(oldIndex);
+		const oldEntry = this.pool.getEntryAtIndex(oldIndex);
 
-		// Mark in underlying pool (public API only works on currentIndex)
-		const savedIdx = (this.pool as any).currentIndex as number;
-		(this.pool as any).currentIndex = oldIndex;
+		// Mark in underlying pool using public API
+		const savedIdx = this.pool.getCurrentIndex();
+		this.pool.setCurrentIndex(oldIndex);
 		this.pool.markFailed(this.failureThreshold);
-		(this.pool as any).currentIndex = savedIdx;
+		this.pool.setCurrentIndex(savedIdx);
 
 		// Remove session from old proxy usage tracking
 		const usedBy = this.proxyUsage.get(oldIndex);
@@ -438,7 +533,7 @@ export class SessionProxyPool {
 		}
 		newUsedBy.add(sessionId);
 
-		const newEntry = this.poolEntryAtIndex(newIndex);
+		const newEntry = this.pool.getEntryAtIndex(newIndex);
 		logPool(`markFailed rotated session=${sessionId.slice(0, 8)} ${oldEntry?.host} -> ${newEntry?.host}`);
 		return true;
 	}
@@ -454,7 +549,7 @@ export class SessionProxyPool {
 		if (!info) return false;
 
 		const oldIndex = info.proxyIndex;
-		const oldEntry = this.poolEntryAtIndex(oldIndex);
+		const oldEntry = this.pool.getEntryAtIndex(oldIndex);
 
 		// Remove from old proxy usage first
 		const usedBy = this.proxyUsage.get(oldIndex);
@@ -470,7 +565,7 @@ export class SessionProxyPool {
 		let bestCount = Infinity;
 		for (let step = 1; step <= this.pool.size; step++) {
 			const i = (oldIndex + step) % this.pool.size;
-			if (model && (this.pool as any).isIndexInCooldown(i, model)) continue;
+			if (model && this.pool.isIndexInCooldown(i, model)) continue;
 			const count = this.proxyUsage.get(i)?.size ?? 0;
 			if (count < bestCount) {
 				bestCount = count;
@@ -493,7 +588,7 @@ export class SessionProxyPool {
 		}
 		newUsedBy.add(sessionId);
 
-		const newEntry = this.poolEntryAtIndex(bestIndex);
+		const newEntry = this.pool.getEntryAtIndex(bestIndex);
 		logPool(`rotateNow session=${sessionId.slice(0, 8)} ${oldEntry?.host} -> ${newEntry?.host}`);
 		return true;
 	}
@@ -514,27 +609,22 @@ export class SessionProxyPool {
 	markRateLimited(sessionId: string, model: string): void {
 		const info = this.sessions.get(sessionId);
 		if (!info) return;
-		const savedIdx = (this.pool as any).currentIndex as number;
-		(this.pool as any).currentIndex = info.proxyIndex;
+		const savedIdx = this.pool.getCurrentIndex();
+		this.pool.setCurrentIndex(info.proxyIndex);
 		this.pool.markRateLimited(model);
-		(this.pool as any).currentIndex = savedIdx;
+		this.pool.setCurrentIndex(savedIdx);
 	}
 
 	// -- Internals ----------------------------------------------------------------
 
 	/** Get the ProxyEntry at a given index. Forward reference to local type. */
 	private poolEntryAtIndex(index: number): ProxyEntry | null {
-		return (this.pool as any).proxies[index] ?? null;
+		return this.pool.getEntryAtIndex(index);
 	}
 
 	/** Build proxy URL string by index. */
 	private formatProxyUrlAtIndex(index: number): string | null {
-		const entry = this.poolEntryAtIndex(index);
-		if (!entry) return null;
-		const auth = entry.username
-			? `${encodeURIComponent(entry.username)}:${encodeURIComponent(entry.password)}@`
-			: "";
-		return `http://${auth}${entry.host}:${entry.port}`;
+		return this.pool.getProxyUrlAtIndex(index);
 	}
 
 	/** Return the index of the proxy with the fewest active sessions, or -1. */
@@ -545,7 +635,7 @@ export class SessionProxyPool {
 		let bestCount = Infinity;
 
 		for (let i = 0; i < this.pool.size; i++) {
-			if (model && (this.pool as any).isIndexInCooldown(i, model)) continue;
+			if (model && this.pool.isIndexInCooldown(i, model)) continue;
 			const count = this.proxyUsage.get(i)?.size ?? 0;
 			logPool(`pickLeastUsed proxy[${i}] count=${count}`);
 			if (count < bestCount) {

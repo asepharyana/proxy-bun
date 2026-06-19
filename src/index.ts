@@ -24,6 +24,7 @@ import {
 	createErrorResponse,
 	createCorsPreflightResponse,
 	getCorsHeaders,
+	setSsrfDnsCheck,
 } from "./lib/relay-utils";
 
 import { checkBodySize } from "./middleware/body-limiter";
@@ -85,6 +86,13 @@ proxyPool.tryLoad(
 // a random session ID so the same proxy is reused for the entire stream.
 const sessionPool = new SessionProxyPool(proxyPool);
 sessionPool.setFailureThreshold(3);
+
+// --- SSRF DNS rebinding protection --------------------------------------------
+
+if (process.env.SSRF_DNS_CHECK === "true") {
+	setSsrfDnsCheck(true);
+	console.log("[relay] SSRF DNS rebinding protection enabled");
+}
 
 // --- WebSocket relay data type -----------------------------------------------
 
@@ -302,7 +310,7 @@ async function handleRelay(
 	}
 
 	// -- Middleware: Rate limiting ---------------------------------------------
-	const rateCheck = rateLimiter.check(clientIP);
+	const rateCheck = await rateLimiter.checkAsync(clientIP);
 	if (!rateCheck.allowed) {
 		logRelayEvent({
 			method,
@@ -438,8 +446,20 @@ function handleWebSocketUpgrade(
 	const relayPath = req.headers.get("x-relay-path") ?? "/";
 
 	const normalized = normalizeTargetUrl(target, relayPath);
-	if (!normalized) return undefined;
-	if (!isAllowedTarget(new URL(normalized.toString()))) return undefined;
+	if (!normalized) {
+		return createErrorResponse({
+			code: "INVALID_TARGET",
+			status: 400,
+			message: "Missing or invalid x-relay-target header",
+		});
+	}
+	if (!isAllowedTarget(new URL(normalized.toString()))) {
+		return createErrorResponse({
+			code: "SSRF_BLOCKED",
+			status: 403,
+			message: "Target domain not allowed",
+		});
+	}
 
 	const targetUrl = normalized.toString();
 
