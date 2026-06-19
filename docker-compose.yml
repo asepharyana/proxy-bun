@@ -7,7 +7,7 @@ services:
     environment:
       HOST: "::"
       PORT: "3000"
-      IPV6_SOURCES: "2001:df4:c140:1f::395,2001:df4:c140:1f::8,2001:df4:c140:1f::d9,2001:df4:c140:1f::db,2001:df4:c140:1f::dd,2001:df4:c140:1f::de,2001:df4:c140:1f::df,2001:df4:c140:1f:ffff:ffff:ffff:ffff"
+      IPV6_SOURCES: "2001:df4:c140:1f::8,2001:df4:c140:1f::395,2001:df4:c140:1f::d9,2001:df4:c140:1f::db,2001:df4:c140:1f::dd,2001:df4:c140:1f::de,2001:df4:c140:1f::df,2001:df4:c140:1f:ffff:ffff:ffff:1,2001:df4:c140:1f:ffff:ffff:ffff:2,2001:df4:c140:1f:ffff:ffff:ffff:ff,2001:df4:c140:1f:ffff:ffff:ffff:100,2001:df4:c140:1f:ffff:ffff:ffff:f000,2001:df4:c140:1f:ffff:ffff:ffff:f0e6,2001:df4:c140:1f:ffff:ffff:ffff:f229,2001:df4:c140:1f:ffff:ffff:ffff:f340,2001:df4:c140:1f:ffff:ffff:ffff:f34b,2001:df4:c140:1f:ffff:ffff:ffff:f3ef,2001:df4:c140:1f:ffff:ffff:ffff:f4ba"
       RELAY_TIMEOUT_MS: "30000"
       RATE_LIMIT_MAX: "1000"
       RATE_LIMIT_WINDOW_MS: "60000"
