@@ -8,6 +8,7 @@ on:
       - 'Dockerfile'
       - 'package.json'
       - 'bun.lock*'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 env:
