@@ -473,6 +473,7 @@ export async function handleAnthropicMessages(
 	proxyPool?: ProxyPool,
 	sessionPool?: SessionProxyPool,
 	sessionId?: string,
+	ipv6Source?: string,
 ): Promise<Response> {
 	// -- Input validation -------------------------------------------------------
 	const validationError = validateAnthropicRequest(body);
@@ -506,8 +507,8 @@ export async function handleAnthropicMessages(
 	// -- Execute with session-aware or standard retry --------------------------
 	const result: FetchWithRetryResult =
 		sessionPool && sessionId
-			? await fetchWithSessionRetry(url, init, sessionPool, sessionId, `anthropic:${req.model}`)
-			: await fetchWithRetry(url, init, proxyPool, `anthropic:${req.model}`);
+			? await fetchWithSessionRetry(url, init, sessionPool, sessionId, `anthropic:${req.model}`, undefined, ipv6Source)
+			: await fetchWithRetry(url, init, proxyPool, `anthropic:${req.model}`, ipv6Source);
 
 	if (result.errorClassification) {
 		if (sessionPool && sessionId) {

@@ -31,6 +31,7 @@ import { checkBodySize } from "./middleware/body-limiter";
 import { createRateLimiter } from "./middleware/rate-limiter";
 import { logRelayEvent } from "./middleware/logger";
 import { ProxyPool, SessionProxyPool } from "./lib/proxy-pool";
+import { IPv6SourcePool } from "./lib/ipv6-pool";
 import { handleChatCompletion, listModels } from "./lib/ai-proxy";
 import { handleAnthropicMessages } from "./lib/anthropic-proxy";
 import { fetchWithRetry, closeAllActiveReaders, isDevMode } from "./lib/fetch-utils";
@@ -40,6 +41,7 @@ import type { Server, ServerWebSocket } from "bun";
 // --- Configuration ------------------------------------------------------------
 
 const PORT = Number.parseInt(process.env.PORT ?? "3000", 10);
+const HOST = process.env.HOST ?? "::";
 const RELAY_TIMEOUT_MS = Number.parseInt(
 	process.env.RELAY_TIMEOUT_MS ?? "30000",
 	10,
@@ -86,6 +88,14 @@ proxyPool.tryLoad(
 // a random session ID so the same proxy is reused for the entire stream.
 const sessionPool = new SessionProxyPool(proxyPool);
 sessionPool.setFailureThreshold(3);
+
+// --- IPv6 source pool (optional) ----------------------------------------------
+
+const ipv6Pool = new IPv6SourcePool();
+ipv6Pool.loadFromEnv();
+if (ipv6Pool.configured) {
+	console.log(`[relay] IPv6 source pool loaded: ${ipv6Pool.size} addresses`);
+}
 
 // --- SSRF DNS rebinding protection --------------------------------------------
 
@@ -388,12 +398,16 @@ async function handleRelay(
 
 	const targetUrlString = targetUrl.toString();
 
+	// -- Get IPv6 source for outbound binding ----------------------------------
+	const ipv6Source = ipv6Pool.getNext() ?? undefined;
+
 	// -- Execute upstream fetch with shared retry -------------------------------
 	const result = await fetchWithRetry(
 		targetUrlString,
 		fetchOptions,
 		proxyPool,
 		"relay",
+		ipv6Source,
 	);
 
 	if (result.errorClassification) {
@@ -477,6 +491,8 @@ function handleWebSocketUpgrade(
 // --- Server ------------------------------------------------------------------
 
 const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
+	hostname: HOST,
+	ipv6Only: false,
 	port: PORT,
 	development: isDevMode() ? { hmr: true, console: true } : undefined,
 
@@ -509,8 +525,9 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 			try {
 				const body = await req.json();
 				const sessionId = crypto.randomUUID();
-				console.log(`[index] POST /v1/chat/completions session=${sessionId.slice(0, 8)} model=${(body as any).model} poolSize=${proxyPool.size} sessionPool.active=${sessionPool.activeSessions}`);
-				return handleChatCompletion(body, proxyPool, sessionPool, sessionId);
+				const ipv6Source = ipv6Pool.getNext() ?? undefined;
+				console.log(`[index] POST /v1/chat/completions session=${sessionId.slice(0, 8)} model=${(body as any).model} poolSize=${proxyPool.size} sessionPool.active=${sessionPool.activeSessions} ipv6=${ipv6Source ?? "none"}`);
+				return handleChatCompletion(body, proxyPool, sessionPool, sessionId, ipv6Source);
 			} catch {
 				return new Response(
 					JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }),
@@ -532,8 +549,9 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 			try {
 				const body = await req.json();
 				const sessionId = crypto.randomUUID();
-				console.log(`[index] POST /v1/messages session=${sessionId.slice(0, 8)} model=${(body as any).model} poolSize=${proxyPool.size} sessionPool.active=${sessionPool.activeSessions}`);
-				return handleAnthropicMessages(body, proxyPool, sessionPool, sessionId);
+				const ipv6Source = ipv6Pool.getNext() ?? undefined;
+				console.log(`[index] POST /v1/messages session=${sessionId.slice(0, 8)} model=${(body as any).model} poolSize=${proxyPool.size} sessionPool.active=${sessionPool.activeSessions} ipv6=${ipv6Source ?? "none"}`);
+				return handleAnthropicMessages(body, proxyPool, sessionPool, sessionId, ipv6Source);
 			} catch {
 				return new Response(
 					JSON.stringify({
@@ -659,7 +677,7 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 // --- Startup -----------------------------------------------------------------
 
 console.log(
-	`[relay] Edge Proxy Relay v${RELAY_VERSION} listening on http://localhost:${server.port}`,
+	`[relay] Edge Proxy Relay v${RELAY_VERSION} listening on http://${HOST}:${server.port}`,
 );
 if (isDevMode()) {
 	console.log("[relay] Development mode: HMR enabled");

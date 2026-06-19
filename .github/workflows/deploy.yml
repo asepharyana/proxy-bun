@@ -1,21 +1,54 @@
-name: Deploy
+name: Deploy to VPS
+
 on:
-  push:
-    branches: [master]
+  repository_dispatch:
+    types: [deploy]
+  workflow_dispatch:
+
+env:
+  VPS_HOST: 45.127.35.244
+  VPS_USER: root
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
         with:
-          bun-version: latest
-      - run: bun install
-      - run: bun run build
-      - run: bun test
+          ssh-private-key: ${{ secrets.VPS_SSH_KEY }}
 
-      - name: Deploy to Cloudflare Workers
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Add VPS to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ env.VPS_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Pull and restart container
+        run: |
+          ssh ${{ env.VPS_USER }}@${{ env.VPS_HOST }} << 'EOF'
+            set -e
+
+            echo "=== Logging in to GHCR ==="
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            echo "=== Pulling latest image ==="
+            docker pull ghcr.io/${{ github.repository }}:latest
+
+            echo "=== Stopping old container ==="
+            cd /opt/edge-proxy
+            docker compose down || true
+
+            echo "=== Starting new container ==="
+            docker compose up -d
+
+            echo "=== Waiting for health check ==="
+            sleep 5
+            curl -sf http://localhost:3000/health || echo "Health check failed"
+
+            echo "=== Deployment complete ==="
+          EOF
+
+      - name: Verify deployment
+        run: |
+          sleep 10
+          curl -sf https://proxy.asepharyana.my.id/health || echo "External health check failed"
