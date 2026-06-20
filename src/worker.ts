@@ -471,6 +471,7 @@ export default {
 				object: "model",
 				created: Math.floor(Date.now() / 1000),
 				owned_by: "proxy",
+				features: ["prompt_caching"],
 			}));
 			return new Response(
 				JSON.stringify({ object: "list", data: models }),

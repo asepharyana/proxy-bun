@@ -569,15 +569,17 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 		if (url.pathname === "/v1/models" && req.method === "GET") {
 			const authErr = requireAuth(req);
 			if (authErr) return authErr;
+			const models = listModels().map((id) => ({
+				id,
+				object: "model",
+				created: Math.floor(Date.now() / 1000),
+				owned_by: "edge-proxy",
+				features: ["prompt_caching"],
+			}));
 			return new Response(
 				JSON.stringify({
 					object: "list",
-					data: listModels().map((id) => ({
-						id,
-						object: "model",
-						created: Math.floor(Date.now() / 1000),
-						owned_by: "edge-proxy",
-					})),
+					data: models,
 				}),
 				{
 					status: 200,

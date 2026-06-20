@@ -11,7 +11,7 @@
  */
 
 import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
-import { MODEL_ROUTES, listModels as listOpenAIModels, type BackendConfig } from "./ai-proxy";
+import { MODEL_ROUTES, type BackendConfig } from "./ai-proxy";
 import { fetchWithRetry, fetchWithSessionRetry, SSELineBuffer, isDevMode, trackReader, releaseReader, wrapStreamWithCleanup, type FetchWithRetryResult } from "./fetch-utils";
 
 // --- Types -------------------------------------------------------------------
@@ -54,7 +54,12 @@ interface AnthropicResponse {
 	model: string;
 	stop_reason: "end_turn" | "max_tokens" | "stop_sequence" | null;
 	stop_sequence: string | null;
-	usage: { input_tokens: number; output_tokens: number };
+	usage: {
+		input_tokens: number;
+		output_tokens: number;
+		cache_creation_input_tokens?: number;
+		cache_read_input_tokens?: number;
+	};
 }
 
 // --- Model resolution ----------------------------------------------------------
@@ -93,8 +98,10 @@ interface BackendBody {
  *
  * Preserves Anthropic content blocks with cache_control so that
  * caching directives are not lost during translation.
+ *
+ * @internal Exported for testing.
  */
-function anthropicToBackend(
+export function anthropicToBackend(
 	anthReq: AnthropicRequest,
 	config: BackendConfig,
 	backendModel: string,
@@ -203,8 +210,30 @@ function anthropicToBackend(
 // --- Translation: Backend -> Anthropic -----------------------------------------
 
 /**
+ * Extract usage tokens from a backend response, normalizing across
+ * OpenAI, Anthropic, and custom formats.
+ */
+function extractUsage(raw: any): AnthropicResponse["usage"] {
+	const usage = raw.usage ?? {};
+	return {
+		input_tokens:
+			usage.input_tokens ??
+			usage.prompt_tokens ??
+			0,
+		output_tokens:
+			usage.output_tokens ??
+			usage.completion_tokens ??
+			0,
+		cache_creation_input_tokens:
+			usage.cache_creation_input_tokens ?? undefined,
+		cache_read_input_tokens:
+			usage.cache_read_input_tokens ?? undefined,
+	};
+}
+
+/**
  * Convert a backend JSON response body into Anthropic Messages format.
- * Extracts token usage from the backend response when available.
+ * Extracts token usage and cache metrics from the backend response.
  */
 function backendToAnthropicResponse(
 	raw: any,
@@ -212,15 +241,6 @@ function backendToAnthropicResponse(
 ): AnthropicResponse {
 	const text =
 		raw.choices?.[0]?.message?.content ?? raw.content ?? raw.text ?? "";
-
-	// Extract usage from various backend formats
-	const usage = raw.usage ?? {};
-	let inputTokens = 0;
-	let outputTokens = 0;
-	if (usage.input_tokens !== undefined) inputTokens = usage.input_tokens;
-	else if (usage.prompt_tokens !== undefined) inputTokens = usage.prompt_tokens;
-	if (usage.output_tokens !== undefined) outputTokens = usage.output_tokens;
-	else if (usage.completion_tokens !== undefined) outputTokens = usage.completion_tokens;
 
 	return {
 		id: raw.id ?? `msg_${Date.now()}`,
@@ -230,10 +250,7 @@ function backendToAnthropicResponse(
 		model,
 		stop_reason: raw.choices?.[0]?.finish_reason === "stop" ? "end_turn" : null,
 		stop_sequence: raw.stop_sequence ?? null,
-		usage: {
-			input_tokens: inputTokens,
-			output_tokens: outputTokens,
-		},
+		usage: extractUsage(raw),
 	};
 }
 
@@ -294,14 +311,49 @@ function extractTextFromSSE(parsed: any): string | null {
 }
 
 /**
+ * Try to extract usage info from a backend SSE data line.
+ * Returns usage object if found, null otherwise.
+ */
+function extractUsageFromSSELine(line: string): AnthropicResponse["usage"] | null {
+	if (!line.startsWith("data: ")) return null;
+	const raw = line.slice(6);
+	if (raw === "[DONE]") return null;
+	try {
+		const parsed = JSON.parse(raw);
+		if (parsed.usage) {
+			return extractUsage(parsed);
+		}
+	} catch {
+		// skip unparseable
+	}
+	return null;
+}
+
+/**
  * Transform a backend SSE line into Anthropic SSE content_block_delta events.
+ * Optionally collects usage from the stream.
+ * When outputCounter is provided, tracks the number of output characters
+ * for estimating output tokens when the backend doesn't report them.
  */
 function backendLineToAnthropicSSE(
 	line: string,
 	_model: string,
 	config: BackendConfig,
+	usageAccum?: AnthropicResponse["usage"],
+	outputCounter?: OutputCounter,
 ): string | null {
 	if (!line || line.trim().length === 0) return null;
+
+	// Try to extract usage from this line
+	if (usageAccum) {
+		const lineUsage = extractUsageFromSSELine(line);
+		if (lineUsage) {
+			if (lineUsage.input_tokens) usageAccum.input_tokens = lineUsage.input_tokens;
+			if (lineUsage.output_tokens) usageAccum.output_tokens = lineUsage.output_tokens;
+			if (lineUsage.cache_creation_input_tokens) usageAccum.cache_creation_input_tokens = lineUsage.cache_creation_input_tokens;
+			if (lineUsage.cache_read_input_tokens) usageAccum.cache_read_input_tokens = lineUsage.cache_read_input_tokens;
+		}
+	}
 
 	if (config.adaptStreamLine) {
 		const adapted = config.adaptStreamLine(line, {} as any);
@@ -312,7 +364,10 @@ function backendLineToAnthropicSSE(
 		try {
 			const parsed = JSON.parse(adapted.replace(/^data: /, ""));
 			const text = extractTextFromSSE(parsed);
-			if (text) return formatContentBlockDelta(text);
+			if (text) {
+				if (outputCounter) outputCounter.chars += text.length;
+				return formatContentBlockDelta(text);
+			}
 			return null;
 		} catch {
 			return null;
@@ -332,7 +387,10 @@ function backendLineToAnthropicSSE(
 				return null;
 			}
 			const text = extractTextFromSSE(parsed);
-			if (text) return formatContentBlockDelta(text);
+			if (text) {
+				if (outputCounter) outputCounter.chars += text.length;
+				return formatContentBlockDelta(text);
+			}
 			return null;
 		} catch {
 			// Not JSON -- treat as plain text
@@ -340,6 +398,7 @@ function backendLineToAnthropicSSE(
 	}
 
 	if (line.length > 0) {
+		if (outputCounter) outputCounter.chars += line.length;
 		return formatContentBlockDelta(line);
 	}
 
@@ -353,6 +412,11 @@ function formatContentBlockDelta(text: string): string {
 		index: 0,
 		delta: { type: "text_delta", text },
 	})}`;
+}
+
+/** Mutable counter shared between backendLineToAnthropicSSE and its caller. */
+interface OutputCounter {
+	chars: number;
 }
 
 // --- Stream transformer --------------------------------------------------------
@@ -369,6 +433,14 @@ function transformAnthropicStream(
 
 	let phase: "init" | "block" | "done" = "init";
 	let messageId = `msg_${Date.now()}`;
+	const outputCounter: OutputCounter = { chars: 0 };
+
+	// Accumulate usage from backend SSE lines (some backends include usage
+	// in their SSE data). Start with zeros, update as we parse lines.
+	const usage: AnthropicResponse["usage"] = {
+		input_tokens: 0,
+		output_tokens: 0,
+	};
 
 	// SSE keepalive: send a comment every 15s to prevent LB/proxy timeout
 	let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
@@ -411,7 +483,7 @@ function transformAnthropicStream(
 							model,
 							stop_reason: null,
 							stop_sequence: null,
-							usage: { input_tokens: 0, output_tokens: 0 },
+							usage,
 						},
 					})}`;
 					controller.enqueue(encoder.encode(startEvent + "\n\n"));
@@ -425,8 +497,6 @@ function transformAnthropicStream(
 				}
 
 				while (phase === "block") {
-					// Process multiple chunks before yielding to event loop
-					// to reduce per-chunk setTimeout overhead (~1-4ms each)
 					const BATCH_SIZE = 8;
 					let chunksProcessed = 0;
 
@@ -437,7 +507,7 @@ function transformAnthropicStream(
 							releaseReader(reader);
 							const remaining = lineBuffer.flush();
 							if (remaining.length > 0) {
-								const adapted = backendLineToAnthropicSSE(remaining, model, config);
+								const adapted = backendLineToAnthropicSSE(remaining, model, config, usage, outputCounter);
 								if (adapted) {
 									controller.enqueue(encoder.encode(adapted + "\n\n"));
 								}
@@ -450,7 +520,7 @@ function transformAnthropicStream(
 						const lines = lineBuffer.add(chunk);
 
 						for (const line of lines) {
-							const adapted = backendLineToAnthropicSSE(line, model, config);
+							const adapted = backendLineToAnthropicSSE(line, model, config, usage, outputCounter);
 							if (adapted) {
 								controller.enqueue(encoder.encode(adapted + "\n\n"));
 							}
@@ -460,13 +530,19 @@ function transformAnthropicStream(
 						if (chunksProcessed >= BATCH_SIZE) {
 							chunksProcessed = 0;
 							await new Promise((r) => setTimeout(r, 0));
-							return; // Yield to event loop, pull will be called again
+							return;
 						}
 					}
 				}
 
 				if (phase === "done") {
 					phase = "done";
+
+					// Estimate output tokens from char count as fallback
+					// when the backend doesn't report usage in SSE lines.
+					if (usage.output_tokens === 0 && outputCounter.chars > 0) {
+						usage.output_tokens = Math.max(1, Math.round(outputCounter.chars / 4));
+					}
 
 					controller.enqueue(
 						encoder.encode(
@@ -479,7 +555,7 @@ function transformAnthropicStream(
 							`event: message_delta\ndata: ${JSON.stringify({
 								type: "message_delta",
 								delta: { stop_reason: "end_turn", stop_sequence: null },
-								usage: { output_tokens: 0 },
+								usage: { output_tokens: usage.output_tokens },
 							})}\n\n`,
 						),
 					);
@@ -557,6 +633,33 @@ function validateAnthropicRequest(body: unknown): ValidationError | null {
 }
 
 // --- Standardized error helper -------------------------------------------------
+
+/** Cache-related response headers to forward from the backend. */
+const CACHE_HEADERS = new Set([
+	"x-cache",
+	"x-cache-status",
+	"cf-cache-status",
+	"x-vercel-cache",
+	"age",
+	"cache-control",
+]);
+
+/**
+ * Forward cache-related headers from the backend response to the client.
+ * These headers help clients know whether the response was cached
+ * (e.g., x-cache: HIT, cf-cache-status: HIT).
+ */
+function forwardCacheHeaders(
+	response: Response,
+	target: Record<string, string>,
+): void {
+	for (const name of CACHE_HEADERS) {
+		const val = response.headers.get(name);
+		if (val) {
+			target[name] = val;
+		}
+	}
+}
 
 function anthropicError(status: number, message: string, type: string): Response {
 	return new Response(
@@ -644,10 +747,14 @@ export async function handleAnthropicMessages(
 	const { config, backendModel } = resolved;
 	const wantsStream = req.stream === true;
 
+	// Default anthropic-version to 2023-06-01 (required for prompt caching).
+	// The client can override via the anthropic-version header.
+	const version = anthropicVersion || "2023-06-01";
+
 	// Translate Anthropic -> backend, preserving cache_control directives
 	// and forwarding anthropic-version when available
 	const { body: backendBody, headers: extraHeaders } = anthropicToBackend(
-		req, config, backendModel, anthropicVersion,
+		req, config, backendModel, version,
 	);
 
 	const init: RequestInit & { proxy?: string } = {
@@ -701,28 +808,29 @@ export async function handleAnthropicMessages(
 	// -- For native Anthropic passthrough, relay the raw backend response -------
 	if (config.anthropicPassthrough) {
 		if (wantsStream) {
+			const headers: Record<string, string> = {
+				"Content-Type": "text/event-stream",
+				"Cache-Control": "no-cache",
+				Connection: "keep-alive",
+				"Access-Control-Allow-Origin": "*",
+				"X-Accel-Buffering": "no",
+			};
+			forwardCacheHeaders(response, headers);
 			return new Response(wrapAnthropicStreamMaybe(response.body!, sessionPool, sessionId), {
 				status: 200,
-				headers: {
-					"Content-Type": "text/event-stream",
-					"Cache-Control": "no-cache",
-					Connection: "keep-alive",
-					"Access-Control-Allow-Origin": "*",
-					"X-Accel-Buffering": "no",
-				},
+				headers,
 			});
 		}
 		const rawBody = await response.text();
 		if (sessionPool && sessionId) {
 			sessionPool.release(sessionId);
 		}
-		return new Response(rawBody, {
-			status: 200,
-			headers: {
-				"Content-Type": "application/json",
-				"Access-Control-Allow-Origin": "*",
-			},
-		});
+		const headers: Record<string, string> = {
+			"Content-Type": "application/json",
+			"Access-Control-Allow-Origin": "*",
+		};
+		forwardCacheHeaders(response, headers);
+		return new Response(rawBody, { status: 200, headers });
 	}
 
 	// -- Handle streaming (OpenAI-compatible backend) ---------------------------
@@ -733,16 +841,15 @@ export async function handleAnthropicMessages(
 			config,
 		);
 		transformed = wrapAnthropicStreamMaybe(transformed, sessionPool, sessionId);
-		return new Response(transformed, {
-			status: 200,
-			headers: {
-				"Content-Type": "text/event-stream",
-				"Cache-Control": "no-cache",
-				Connection: "keep-alive",
-				"Access-Control-Allow-Origin": "*",
-				"X-Accel-Buffering": "no",
-			},
-		});
+		const headers: Record<string, string> = {
+			"Content-Type": "text/event-stream",
+			"Cache-Control": "no-cache",
+			Connection: "keep-alive",
+			"Access-Control-Allow-Origin": "*",
+			"X-Accel-Buffering": "no",
+		};
+		forwardCacheHeaders(response, headers);
+		return new Response(transformed, { status: 200, headers });
 	}
 
 	// -- Handle non-streaming (OpenAI-compatible backend) -----------------------
@@ -750,6 +857,15 @@ export async function handleAnthropicMessages(
 	if (sessionPool && sessionId) {
 		sessionPool.release(sessionId);
 	}
+
+	const buildBaseHeaders = (): Record<string, string> => {
+		const h: Record<string, string> = {
+			"Content-Type": "application/json",
+			"Access-Control-Allow-Origin": "*",
+		};
+		forwardCacheHeaders(response, h);
+		return h;
+	};
 
 	if (text.trimStart().startsWith("data: ")) {
 		const accumulated = accumulateSSEText(text);
@@ -767,10 +883,7 @@ export async function handleAnthropicMessages(
 				}),
 				{
 					status: 200,
-					headers: {
-						"Content-Type": "application/json",
-						"Access-Control-Allow-Origin": "*",
-					},
+					headers: buildBaseHeaders(),
 				},
 			);
 		}
@@ -787,10 +900,7 @@ export async function handleAnthropicMessages(
 
 	return new Response(JSON.stringify(adapted), {
 		status: 200,
-		headers: {
-			"Content-Type": "application/json",
-			"Access-Control-Allow-Origin": "*",
-		},
+		headers: buildBaseHeaders(),
 	});
 }
 
