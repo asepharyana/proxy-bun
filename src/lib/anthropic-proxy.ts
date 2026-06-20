@@ -285,9 +285,33 @@ function transformAnthropicStream(
 	let phase: "init" | "block" | "done" = "init";
 	let messageId = `msg_${Date.now()}`;
 
+	// SSE keepalive: send a comment every 15s to prevent LB/proxy timeout
+	let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+	const KEEPALIVE_INTERVAL_MS = 15_000;
+
+	function startKeepalive(controller: ReadableStreamDefaultController) {
+		if (keepaliveTimer) return;
+		keepaliveTimer = setInterval(() => {
+			try {
+				controller.enqueue(encoder.encode(": keepalive\n\n"));
+			} catch {
+				if (keepaliveTimer) clearInterval(keepaliveTimer);
+			}
+		}, KEEPALIVE_INTERVAL_MS);
+	}
+
+	function stopKeepalive() {
+		if (keepaliveTimer) {
+			clearInterval(keepaliveTimer);
+			keepaliveTimer = null;
+		}
+	}
+
 	return new ReadableStream({
 		async pull(controller) {
 			try {
+				startKeepalive(controller);
+
 				if (phase === "init") {
 					phase = "block";
 					messageId = `msg_${Date.now()}`;
@@ -318,6 +342,7 @@ function transformAnthropicStream(
 				while (phase === "block") {
 					const { done, value } = await reader.read();
 					if (done) {
+						stopKeepalive();
 						const remaining = lineBuffer.flush();
 						if (remaining.length > 0) {
 							const adapted = backendLineToAnthropicSSE(remaining, model, config);
@@ -339,6 +364,8 @@ function transformAnthropicStream(
 						}
 					}
 
+					// Yield to event loop after each chunk
+					await new Promise((r) => setTimeout(r, 0));
 					return;
 				}
 
@@ -370,6 +397,7 @@ function transformAnthropicStream(
 					controller.close();
 				}
 			} catch (err) {
+				stopKeepalive();
 				if (isDevMode()) {
 					controller.enqueue(
 						encoder.encode(
@@ -385,6 +413,10 @@ function transformAnthropicStream(
 				}
 				controller.close();
 			}
+		},
+		cancel() {
+			stopKeepalive();
+			reader.cancel();
 		},
 	});
 }

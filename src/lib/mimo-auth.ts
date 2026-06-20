@@ -18,6 +18,7 @@ import * as os from "node:os";
 
 let cachedJwt: string | null = null;
 let jwtExpiry = 0; // epoch ms
+let pendingRefresh: Promise<string> | null = null; // dedup concurrent refreshes
 
 const MIMO_BOOTSTRAP_URL = "https://api.xiaomimimo.com/api/free-ai/bootstrap";
 const EXPIRY_BUFFER_MS = 300_000; // 5 minutes
@@ -112,7 +113,13 @@ export async function getJwt(): Promise<string> {
   if (cachedJwt && jwtExpiry > now + EXPIRY_BUFFER_MS) {
     return cachedJwt;
   }
-  return bootstrapJwt();
+  // Dedup concurrent refresh — all callers share the same Promise
+  if (!pendingRefresh) {
+    pendingRefresh = bootstrapJwt().finally(() => {
+      pendingRefresh = null;
+    });
+  }
+  return pendingRefresh;
 }
 
 /**
@@ -124,4 +131,5 @@ export async function getJwt(): Promise<string> {
 export function invalidateJwt(): void {
   cachedJwt = null;
   jwtExpiry = 0;
+  pendingRefresh = null;
 }

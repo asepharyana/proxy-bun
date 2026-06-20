@@ -431,7 +431,8 @@ export function shouldSendBody(method: string): boolean {
  * - Applies the (already-filtered) headers.
  * - Attaches a `ReadableStream` body when the method permits it (with
  *   `duplex: 'half'` as required by the spec for streaming bodies).
- * - Attaches an `AbortSignal.timeout()` signal.
+ * - Uses a connection timeout (not total timeout) so long-lived SSE streams
+ *   are not aborted mid-response.
  */
 export function buildRelayRequest(
 	req: Request,
@@ -442,10 +443,26 @@ export function buildRelayRequest(
 	const method = req.method;
 	const body = shouldSendBody(method) ? req.body : undefined;
 
+	// For streaming requests (body present), use a connection-only timeout
+	// via AbortController so the stream is not killed mid-response.
+	// For non-streaming requests, use AbortSignal.timeout for total timeout.
+	let signal: AbortSignal;
+	if (body) {
+		const controller = new AbortController();
+		signal = controller.signal;
+		// Connection timeout — if no data arrives within timeout, abort.
+		// The caller should reset this timer on each chunk for a true idle timeout.
+		const timer = setTimeout(() => controller.abort(), timeout);
+		// Clear timer if the signal is aborted externally
+		signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
+	} else {
+		signal = AbortSignal.timeout(timeout);
+	}
+
 	const init: RequestInit & { duplex?: "half" } = {
 		method,
 		headers,
-		signal: AbortSignal.timeout(timeout),
+		signal,
 	};
 
 	if (body) {

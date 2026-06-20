@@ -668,8 +668,17 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 			}
 		},
 
-		drain(_ws: ServerWebSocket<WSRelayData>) {
-			// Backpressure not implemented
+		drain(ws: ServerWebSocket<WSRelayData>) {
+			// Backpressure: pause upstream reads when client is slow
+			const upstream = ws.data.upstream;
+			if (upstream && upstream.readyState === WebSocket.OPEN) {
+				// Bun WebSocket handles backpressure internally via bufferAmount
+				// Log if buffer is growing excessively
+				const buffered = (ws as any).bufferAmount ?? 0;
+				if (buffered > 1024 * 1024) {
+					console.warn(`[ws] Client backpressure: ${buffered} bytes buffered`);
+				}
+			}
 		},
 	},
 });

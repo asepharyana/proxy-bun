@@ -576,12 +576,37 @@ function transformStream(
 	const encoder = new TextEncoder();
 	const lineBuffer = new SSELineBuffer();
 
+	// SSE keepalive: send a comment every 15s to prevent LB/proxy timeout
+	let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+	const KEEPALIVE_INTERVAL_MS = 15_000;
+
+	function startKeepalive(controller: ReadableStreamDefaultController) {
+		if (keepaliveTimer) return;
+		keepaliveTimer = setInterval(() => {
+			try {
+				controller.enqueue(encoder.encode(": keepalive\n\n"));
+			} catch {
+				// Stream already closed
+				if (keepaliveTimer) clearInterval(keepaliveTimer);
+			}
+		}, KEEPALIVE_INTERVAL_MS);
+	}
+
+	function stopKeepalive() {
+		if (keepaliveTimer) {
+			clearInterval(keepaliveTimer);
+			keepaliveTimer = null;
+		}
+	}
+
 	return new ReadableStream({
 		async pull(controller) {
 			try {
+				startKeepalive(controller);
 				while (true) {
 					const { done, value } = await reader.read();
 					if (done) {
+						stopKeepalive();
 						// Flush remaining text after stream ends
 						const remaining = lineBuffer.flush();
 						if (remaining.length > 0) {
@@ -612,8 +637,12 @@ function transformStream(
 							controller.enqueue(encoder.encode(line + "\n\n"));
 						}
 					}
+
+					// Yield to event loop after each chunk to prevent starvation
+					await new Promise((r) => setTimeout(r, 0));
 				}
 			} catch (err) {
+				stopKeepalive();
 				if (isDevMode()) {
 					controller.enqueue(
 						encoder.encode(
@@ -629,6 +658,10 @@ function transformStream(
 				}
 				controller.close();
 			}
+		},
+		cancel() {
+			stopKeepalive();
+			reader.cancel();
 		},
 	});
 }

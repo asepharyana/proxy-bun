@@ -24,6 +24,7 @@ interface AichatSession {
 // --- Module-level cache ------------------------------------------------------
 
 let session: AichatSession | null = null;
+let pendingBootstrap: Promise<AichatSession> | null = null; // dedup concurrent refreshes
 
 // --- Session bootstrap ------------------------------------------------------
 
@@ -106,7 +107,13 @@ export async function getAichatSession(): Promise<{
   if (session && Date.now() - session.fetchedAt < SESSION_REFRESH_MS) {
     return { cookies: session.cookies, csrfToken: session.csrfToken };
   }
-  const fresh = await bootstrapSession();
+  // Dedup concurrent bootstrap — all callers share the same Promise
+  if (!pendingBootstrap) {
+    pendingBootstrap = bootstrapSession().finally(() => {
+      pendingBootstrap = null;
+    });
+  }
+  const fresh = await pendingBootstrap;
   return { cookies: fresh.cookies, csrfToken: fresh.csrfToken };
 }
 
@@ -157,4 +164,5 @@ export function updateAichatSessionFromResponse(response: Response): void {
  */
 export function invalidateAichatSession(): void {
   session = null;
+  pendingBootstrap = null;
 }
