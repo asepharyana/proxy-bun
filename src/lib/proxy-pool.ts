@@ -41,6 +41,8 @@ export class ProxyPool {
 	/** host:port::model -> expiry epoch ms */
 	private cooldowns = new Map<string, number>();
 	private cooldownDuration = 60000; // default 60s
+	/** Periodic cleanup timer for expired cooldowns */
+	private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
 	// -- Load --------------------------------------------------------------------
 
@@ -126,7 +128,27 @@ export class ProxyPool {
 		this.currentIndex = 0;
 		this.failures.clear();
 
+		// Start periodic cooldown cleanup (every 30s)
+		this.startCooldownCleanup();
+
 		logPool(`loaded ${this.proxies.length} proxies from ${source}`);
+	}
+
+	/** Periodically clean up expired cooldown entries to prevent memory leaks. */
+	private startCooldownCleanup(): void {
+		if (this.cleanupTimer) return;
+		this.cleanupTimer = setInterval(() => {
+			const now = Date.now();
+			for (const [key, expiry] of this.cooldowns) {
+				if (now > expiry) {
+					this.cooldowns.delete(key);
+				}
+			}
+		}, 30_000); // every 30s
+		// Allow process to exit even if timer is active
+		if (this.cleanupTimer && typeof this.cleanupTimer === "object" && "unref" in this.cleanupTimer) {
+			this.cleanupTimer.unref();
+		}
 	}
 
 	/**

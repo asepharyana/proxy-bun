@@ -13,7 +13,7 @@
  */
 
 import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
-import { fetchWithRetry, fetchWithSessionRetry, SSELineBuffer, isDevMode, type FetchWithRetryResult } from "./fetch-utils";
+import { fetchWithRetry, fetchWithSessionRetry, SSELineBuffer, isDevMode, trackReader, releaseReader, wrapStreamWithCleanup, type FetchWithRetryResult } from "./fetch-utils";
 import { getJwt, invalidateJwt } from "./mimo-auth";
 import * as aichatAuth from "./aichat-auth";
 
@@ -377,6 +377,13 @@ export async function handleChatCompletion(
 	sessionPool?: SessionProxyPool,
 	sessionId?: string,
 	ipv6Source?: string,
+): Promise<Response>;
+export async function handleChatCompletion(
+	body: unknown,
+	proxyPool?: ProxyPool,
+	sessionPool?: SessionProxyPool,
+	sessionId?: string,
+	ipv6Source?: string,
 ): Promise<Response> {
 	// -- Input validation -------------------------------------------------------
 	const validationError = validateChatRequest(body);
@@ -571,7 +578,7 @@ function transformStream(
 	config: BackendConfig,
 	req: OpenAIRequest,
 ): ReadableStream {
-	const reader = body.getReader();
+	const reader = trackReader(body.getReader() as any as ReadableStreamDefaultReader);
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
 	const lineBuffer = new SSELineBuffer();
@@ -603,10 +610,16 @@ function transformStream(
 		async pull(controller) {
 			try {
 				startKeepalive(controller);
+				// Process multiple chunks before yielding to event loop
+				// to reduce per-chunk setTimeout overhead (~1-4ms each)
+				const BATCH_SIZE = 8;
+				let chunksProcessed = 0;
+
 				while (true) {
 					const { done, value } = await reader.read();
 					if (done) {
 						stopKeepalive();
+						releaseReader(reader);
 						// Flush remaining text after stream ends
 						const remaining = lineBuffer.flush();
 						if (remaining.length > 0) {
@@ -638,11 +651,16 @@ function transformStream(
 						}
 					}
 
-					// Yield to event loop after each chunk to prevent starvation
-					await new Promise((r) => setTimeout(r, 0));
+					chunksProcessed++;
+					// Yield to event loop after batch to prevent starvation
+					if (chunksProcessed >= BATCH_SIZE) {
+						chunksProcessed = 0;
+						await new Promise((r) => setTimeout(r, 0));
+					}
 				}
 			} catch (err) {
 				stopKeepalive();
+				releaseReader(reader);
 				if (isDevMode()) {
 					controller.enqueue(
 						encoder.encode(
@@ -671,6 +689,7 @@ function transformStream(
 /**
  * If a session is active, wrap the stream so the session is released on end/error.
  * Otherwise pass through the stream unchanged.
+ * Uses the shared wrapStreamWithCleanup from fetch-utils.
  */
 function wrapStreamMaybe(
 	body: ReadableStream,
@@ -679,33 +698,4 @@ function wrapStreamMaybe(
 ): ReadableStream {
 	if (!sessionPool || !sessionId) return body;
 	return wrapStreamWithCleanup(body, () => sessionPool.release(sessionId));
-}
-
-/**
- * Wraps a ReadableStream and calls `cleanup` when the stream ends, errors,
- * or is cancelled by the consumer.
- */
-function wrapStreamWithCleanup(body: ReadableStream, cleanup: () => void): ReadableStream {
-	const reader = body.getReader();
-
-	return new ReadableStream({
-		async pull(controller) {
-			try {
-				const { done, value } = await reader.read();
-				if (done) {
-					cleanup();
-					controller.close();
-					return;
-				}
-				controller.enqueue(value);
-			} catch (err) {
-				cleanup();
-				controller.error(err);
-			}
-		},
-		cancel(reason) {
-			cleanup();
-			reader.cancel(reason);
-		},
-	});
 }

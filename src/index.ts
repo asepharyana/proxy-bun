@@ -110,6 +110,8 @@ interface WSRelayData {
 	target: string;
 	relayPath: string;
 	upstream?: WebSocket;
+	/** Set when client buffer exceeds threshold — stops forwarding upstream data */
+	paused?: boolean;
 }
 
 // --- Route handlers ----------------------------------------------------------
@@ -621,6 +623,9 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 			};
 
 			upstream.onmessage = (event: MessageEvent) => {
+				// Backpressure: drop messages when client buffer is full
+				if (ws.data.paused) return;
+
 				const data = event.data;
 				if (typeof data === "string") {
 					ws.sendText(data);
@@ -628,7 +633,9 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 					ws.sendBinary(new Uint8Array(data));
 				} else if (data instanceof Blob) {
 					data.arrayBuffer().then((buf) => {
-						ws.sendBinary(new Uint8Array(buf));
+						if (!ws.data.paused) {
+							ws.sendBinary(new Uint8Array(buf));
+						}
 					});
 				} else {
 					ws.sendBinary(data as unknown as Uint8Array);
@@ -669,15 +676,22 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 		},
 
 		drain(ws: ServerWebSocket<WSRelayData>) {
-			// Backpressure: pause upstream reads when client is slow
+			// Backpressure: pause forwarding when client buffer is large
 			const upstream = ws.data.upstream;
-			if (upstream && upstream.readyState === WebSocket.OPEN) {
-				// Bun WebSocket handles backpressure internally via bufferAmount
-				// Log if buffer is growing excessively
-				const buffered = (ws as any).bufferAmount ?? 0;
-				if (buffered > 1024 * 1024) {
-					console.warn(`[ws] Client backpressure: ${buffered} bytes buffered`);
+			if (!upstream || upstream.readyState !== WebSocket.OPEN) return;
+
+			const buffered = (ws as any).bufferAmount ?? 0;
+			const BACKPRESSURE_THRESHOLD = 512 * 1024; // 512KB
+			const RESUME_THRESHOLD = 64 * 1024;        // 64KB
+
+			if (buffered > BACKPRESSURE_THRESHOLD) {
+				if (!ws.data.paused) {
+					ws.data.paused = true;
+					console.warn(`[ws] Client backpressure: pausing upstream forwarding (${buffered} bytes buffered)`);
 				}
+			} else if (ws.data.paused && buffered < RESUME_THRESHOLD) {
+				ws.data.paused = false;
+				console.log(`[ws] Client backpressure cleared: resuming upstream forwarding (${buffered} bytes buffered)`);
 			}
 		},
 	},
@@ -694,11 +708,11 @@ if (isDevMode()) {
 
 // --- Graceful Shutdown -------------------------------------------------------
 
-const shutdownHandler = (signal: string) => {
+const shutdownHandler = async (signal: string) => {
 	console.log(`\n[relay] Received ${signal}, shutting down gracefully...`);
 
 	// Close active SSE streams so clients get proper stream end events
-	closeAllActiveReaders();
+	await closeAllActiveReaders();
 
 	server.stop();
 	process.exit(0);

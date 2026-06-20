@@ -42,13 +42,16 @@ export function createRateLimiter(options?: RateLimiterOptions): RateLimiter {
 
 	function pruneTimestamps(timestamps: number[], now: number): number[] {
 		const cutoff = now - windowMs;
-		const result: number[] = [];
-		for (let i = 0; i < timestamps.length; i++) {
-			if (timestamps[i] >= cutoff) {
-				result.push(timestamps[i]);
-			}
+		// Find the first valid index using binary search-like scan
+		// (timestamps are monotonically increasing, so we can find the cutoff point)
+		let keepStart = 0;
+		while (keepStart < timestamps.length && timestamps[keepStart]! < cutoff) {
+			keepStart++;
 		}
-		return result;
+		// Only allocate a new array if pruning is needed
+		if (keepStart === 0) return timestamps;
+		if (keepStart >= timestamps.length) return [];
+		return timestamps.slice(keepStart);
 	}
 
 	/** Periodically sweep the entire memory store to free memory. */
@@ -58,16 +61,16 @@ export function createRateLimiter(options?: RateLimiterOptions): RateLimiter {
 		const cutoff = now - windowMs;
 
 		for (const [key, timestamps] of store) {
-			const pruned: number[] = [];
-			for (let i = 0; i < timestamps.length; i++) {
-				if (timestamps[i] >= cutoff) {
-					pruned.push(timestamps[i]);
-				}
+			// Find first valid index (timestamps are sorted ascending)
+			let keepStart = 0;
+			while (keepStart < timestamps.length && timestamps[keepStart]! < cutoff) {
+				keepStart++;
 			}
-			if (pruned.length === 0) {
+			if (keepStart === 0) continue; // all valid, skip
+			if (keepStart >= timestamps.length) {
 				store.delete(key);
 			} else {
-				store.set(key, pruned);
+				store.set(key, timestamps.slice(keepStart));
 			}
 		}
 

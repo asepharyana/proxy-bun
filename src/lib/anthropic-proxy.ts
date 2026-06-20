@@ -12,9 +12,7 @@
 
 import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
 import { MODEL_ROUTES, type BackendConfig } from "./ai-proxy";
-import { fetchWithRetry, fetchWithSessionRetry, type FetchWithRetryResult } from "./fetch-utils";
-import { SSELineBuffer } from "./fetch-utils";
-import { isDevMode } from "./fetch-utils";
+import { fetchWithRetry, fetchWithSessionRetry, SSELineBuffer, isDevMode, trackReader, releaseReader, wrapStreamWithCleanup, type FetchWithRetryResult } from "./fetch-utils";
 
 // --- Types -------------------------------------------------------------------
 
@@ -277,7 +275,7 @@ function transformAnthropicStream(
 	model: string,
 	config: BackendConfig,
 ): ReadableStream {
-	const reader = body.getReader();
+	const reader = trackReader(body.getReader() as any as ReadableStreamDefaultReader);
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
 	const lineBuffer = new SSELineBuffer();
@@ -340,33 +338,44 @@ function transformAnthropicStream(
 				}
 
 				while (phase === "block") {
-					const { done, value } = await reader.read();
-					if (done) {
-						stopKeepalive();
-						const remaining = lineBuffer.flush();
-						if (remaining.length > 0) {
-							const adapted = backendLineToAnthropicSSE(remaining, model, config);
+					// Process multiple chunks before yielding to event loop
+					// to reduce per-chunk setTimeout overhead (~1-4ms each)
+					const BATCH_SIZE = 8;
+					let chunksProcessed = 0;
+
+					while (phase === "block") {
+						const { done, value } = await reader.read();
+						if (done) {
+							stopKeepalive();
+							releaseReader(reader);
+							const remaining = lineBuffer.flush();
+							if (remaining.length > 0) {
+								const adapted = backendLineToAnthropicSSE(remaining, model, config);
+								if (adapted) {
+									controller.enqueue(encoder.encode(adapted + "\n\n"));
+								}
+							}
+							phase = "done";
+							break;
+						}
+
+						const chunk = decoder.decode(value, { stream: true });
+						const lines = lineBuffer.add(chunk);
+
+						for (const line of lines) {
+							const adapted = backendLineToAnthropicSSE(line, model, config);
 							if (adapted) {
 								controller.enqueue(encoder.encode(adapted + "\n\n"));
 							}
 						}
-						phase = "done";
-						break;
-					}
 
-					const chunk = decoder.decode(value, { stream: true });
-					const lines = lineBuffer.add(chunk);
-
-					for (const line of lines) {
-						const adapted = backendLineToAnthropicSSE(line, model, config);
-						if (adapted) {
-							controller.enqueue(encoder.encode(adapted + "\n\n"));
+						chunksProcessed++;
+						if (chunksProcessed >= BATCH_SIZE) {
+							chunksProcessed = 0;
+							await new Promise((r) => setTimeout(r, 0));
+							return; // Yield to event loop, pull will be called again
 						}
 					}
-
-					// Yield to event loop after each chunk
-					await new Promise((r) => setTimeout(r, 0));
-					return;
 				}
 
 				if (phase === "done") {
@@ -398,6 +407,7 @@ function transformAnthropicStream(
 				}
 			} catch (err) {
 				stopKeepalive();
+				releaseReader(reader);
 				if (isDevMode()) {
 					controller.enqueue(
 						encoder.encode(
@@ -499,6 +509,13 @@ export async function handleAnthropicMessages(
 	proxyPool?: ProxyPool,
 	sessionPool?: SessionProxyPool,
 	sessionId?: string,
+): Promise<Response>;
+export async function handleAnthropicMessages(
+	body: unknown,
+	proxyPool?: ProxyPool,
+	sessionPool?: SessionProxyPool,
+	sessionId?: string,
+	ipv6Source?: string,
 ): Promise<Response>;
 export async function handleAnthropicMessages(
 	body: unknown,
@@ -650,6 +667,7 @@ export async function handleAnthropicMessages(
 /**
  * If a session is active, wrap the stream so the session is released on end/error.
  * Otherwise pass through the stream unchanged.
+ * Uses the shared wrapStreamWithCleanup from fetch-utils.
  */
 function wrapAnthropicStreamMaybe(
 	body: ReadableStream,
@@ -657,34 +675,5 @@ function wrapAnthropicStreamMaybe(
 	sessionId?: string,
 ): ReadableStream {
 	if (!sessionPool || !sessionId) return body;
-	return wrapAnthropicStreamWithCleanup(body, () => sessionPool.release(sessionId));
-}
-
-/**
- * Wraps a ReadableStream and calls `cleanup` when the stream ends, errors,
- * or is cancelled by the consumer.
- */
-function wrapAnthropicStreamWithCleanup(body: ReadableStream, cleanup: () => void): ReadableStream {
-	const reader = body.getReader();
-
-	return new ReadableStream({
-		async pull(controller) {
-			try {
-				const { done, value } = await reader.read();
-				if (done) {
-					cleanup();
-					controller.close();
-					return;
-				}
-				controller.enqueue(value);
-			} catch (err) {
-				cleanup();
-				controller.error(err);
-			}
-		},
-		cancel(reason) {
-			cleanup();
-			reader.cancel(reason);
-		},
-	});
+	return wrapStreamWithCleanup(body, () => sessionPool.release(sessionId));
 }

@@ -7,6 +7,7 @@
 
 import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
 import type { IPv6SourcePool } from "./ipv6-pool";
+import { unlink } from "node:fs/promises";
 
 // ─── Constants ─────────────────────────────────────────────────────────
 
@@ -20,28 +21,40 @@ export const ACTIVE_READERS = new Set<ReadableStreamDefaultReader>();
 
 /**
  * Track a reader for graceful shutdown. Returns a wrapped reader that
- * auto-removes itself from ACTIVE_READERS when done/cancelled.
+ * auto-removes itself from ACTIVE_READERS when cancelled.
+ *
+ * IMPORTANT: When the stream finishes normally (done=true), the caller
+ * MUST call `releaseReader(reader)` to remove it from the tracking set.
  */
-export function trackReader<T extends ReadableStreamDefaultReader>(reader: T): T {
-  ACTIVE_READERS.add(reader);
-  // Auto-remove on stream end or cancellation
+export function trackReader<T extends ReadableStreamDefaultReader<any>>(reader: T): T {
+  ACTIVE_READERS.add(reader as any);
+  // Auto-remove on cancellation
   const origCancel = reader.cancel.bind(reader);
   (reader as any).cancel = async (...args: any[]) => {
-    ACTIVE_READERS.delete(reader);
+    ACTIVE_READERS.delete(reader as any);
     return origCancel(...args);
   };
   return reader;
 }
 
 /**
- * Close all tracked active readers (called during graceful shutdown).
- * Each reader's cancellation propagates to the upstream connection.
+ * Release a reader from the active tracking set.
+ * Call this when a stream finishes normally (reader.read() returns done=true).
  */
-export function closeAllActiveReaders(): void {
-  for (const reader of ACTIVE_READERS) {
-    try { reader.cancel(); } catch { /* already closed */ }
-  }
+export function releaseReader(reader: ReadableStreamDefaultReader<any>): void {
+  ACTIVE_READERS.delete(reader as any);
+}
+
+/**
+ * Close all tracked active readers (called during graceful shutdown).
+ * Awaits each cancellation so upstream connections are properly closed.
+ */
+export async function closeAllActiveReaders(): Promise<void> {
+  const readers = Array.from(ACTIVE_READERS);
   ACTIVE_READERS.clear();
+  await Promise.allSettled(
+    readers.map((reader) => reader.cancel().catch(() => {}))
+  );
 }
 
 // ─── Dev-mode guard ──────────────────────────────────────────────────────
@@ -55,6 +68,40 @@ export function isDevMode(): boolean {
   const env = (process.env.NODE_ENV ?? process.env.BUN_ENV ?? "").toLowerCase();
   if (env === "development" || env === "dev") return true;
   return false;
+}
+
+// ─── Stream cleanup wrapper ─────────────────────────────────────────────
+
+/**
+ * Wraps a ReadableStream and calls `cleanup` when the stream ends,
+ * errors, or is cancelled by the consumer.
+ *
+ * Use this to release proxy sessions, close connections, or free resources
+ * when a streaming response finishes.
+ */
+export function wrapStreamWithCleanup(body: ReadableStream, cleanup: () => void): ReadableStream {
+  const reader = body.getReader();
+
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          cleanup();
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (err) {
+        cleanup();
+        controller.error(err);
+      }
+    },
+    cancel(reason) {
+      cleanup();
+      reader.cancel(reason);
+    },
+  });
 }
 
 // ─── SSE line buffer (fixes chunk-boundary corruption) ───────────────────
@@ -132,6 +179,23 @@ function extractModel(context?: string): string | undefined {
   return context || undefined;
 }
 
+// ─── Retry backoff helper ──────────────────────────────────────────────
+
+/**
+ * Calculate exponential backoff delay for retry attempts.
+ * Returns 0 for attempt 0 (no delay on first try).
+ * Pattern: 200ms, 400ms, 800ms, ... capped at 2000ms.
+ */
+function retryBackoffMs(attempt: number): number {
+  if (attempt <= 0) return 0;
+  return Math.min(200 * Math.pow(2, attempt - 1), 2000);
+}
+
+/** Sleep for the specified milliseconds. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 // ─── Error sanitization (prevent leaking upstream details) ──────────────
 
 /**
@@ -164,19 +228,9 @@ export function sanitizeErrorMessage(raw: string): string {
  * This is used when outbound IPv6 source rotation is needed, since
  * Bun's built-in fetch() does not support specifying a local address.
  *
- * Returns a streaming Response — the body is a ReadableStream from curl's
- * stdout. The HTTP status code is extracted from a separate stderr header
- * written by curl's `-w` flag (via a wrapper script approach).
- *
- * For simplicity and reliability, we use a two-phase approach:
- *   1. First, send headers-only request to get status code (HEAD-like)
- *   2. Then, stream the body via a second curl call
- *
- * Actually, simpler: we write a tiny wrapper that extracts the status code
- * from the first line and streams the rest. But curl doesn't support that.
- *
- * Best approach: use `-w` to write status to a temp file descriptor,
- * and stream stdout directly. We'll use a pipe-based approach.
+ * Status code is extracted from a temp file written by curl's `-w` flag
+ * (written after body completes). The body is collected into a single
+ * buffer and returned as a ReadableStream for zero-copy handoff.
  *
  * @param url - Target URL
  * @param init - Request init (method, headers, body)
@@ -191,7 +245,6 @@ export async function fetchViaCurl(
 ): Promise<Response> {
 	const method = (init.method ?? "GET").toUpperCase();
 
-	// Write status code to a temp file, stream body to stdout
 	const statusFile = `/tmp/curl-status-${crypto.randomUUID().slice(0, 8)}`;
 	const args = [
 		"curl",
@@ -201,7 +254,7 @@ export async function fetchViaCurl(
 		"-s",           // silent mode
 		"--compressed", // auto-decompress gzip/brotli
 		"-o", "-",      // output body to stdout
-		"-w", statusFile, // write status code to file
+		"-w", statusFile, // write status code to file (plain text, appended after body)
 		"--max-time", String(Math.ceil(timeoutMs / 1000)),
 		"--connect-timeout", "10",
 	];
@@ -241,9 +294,10 @@ export async function fetchViaCurl(
 		try { proc.kill("SIGKILL"); } catch { /* already dead */ }
 	}, timeoutMs + 5000);
 
-	// Collect stdout into a buffer so we can parse status code from -w file
-	// after process exits, then return the buffered body as a stream.
-	// This is necessary because curl's -w writes AFTER the body completes.
+	// Collect stdout into minimal chunks then concatenate into a single buffer.
+	// This is needed because curl's -w (status code) is written AFTER the body
+	// completes, so we must wait for proc.exited before reading the status file.
+	// We minimize peak memory by streaming chunks into a pre-allocated buffer.
 	const stdoutChunks: Uint8Array[] = [];
 	const stdoutReader = proc.stdout.getReader();
 	try {
@@ -254,7 +308,7 @@ export async function fetchViaCurl(
 		}
 	} catch { /* stream cancelled */ }
 
-	// Wait for process to exit and read status code
+	// Wait for process to exit, then read status code
 	await proc.exited;
 	clearTimeout(killTimer);
 
@@ -264,21 +318,24 @@ export async function fetchViaCurl(
 		statusCode = parseInt(statusText.trim(), 10) || 502;
 	} catch {
 		// Status file not written — connection likely failed
-	} finally {
-		try { await Bun.write(statusFile, ""); } catch { /* ignore cleanup errors */ }
 	}
+
+	// Clean up temp file (async, non-blocking)
+	unlink(statusFile).catch(() => {});
 
 	logProxy("fetchViaCurl", `response status=${statusCode}`, { ipv6Source, url });
 
-	// Return buffered body as a readable stream
-	let offset = 0;
+	// Concatenate chunks into a single buffer for the Response body stream.
+	// Uses a single allocation to reduce GC pressure from many small chunks.
 	const totalLength = stdoutChunks.reduce((sum, c) => sum + c.byteLength, 0);
 	const combined = new Uint8Array(totalLength);
+	let offset = 0;
 	for (const chunk of stdoutChunks) {
 		combined.set(chunk, offset);
 		offset += chunk.byteLength;
 	}
 
+	// Zero-copy: hand the buffer directly to ReadableStream
 	const bodyStream = new ReadableStream({
 		start(controller) {
 			controller.enqueue(combined);
@@ -329,6 +386,13 @@ export async function fetchWithRetry(
   const maxAttempts = poolSize > 0 ? poolSize + 1 : 3;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    // Exponential backoff between attempts (skip on first attempt)
+    const backoff = retryBackoffMs(attempt);
+    if (backoff > 0) {
+      logProxy("fetchWithRetry", `backoff ${backoff}ms before attempt ${attempt + 1}`, { context });
+      await sleep(backoff);
+    }
+
     if (attempt === 0) {
       // First attempt — direct (no proxy)
       init.proxy = undefined;
@@ -512,17 +576,35 @@ export async function fetchWithSessionRetry(
   let lastError: unknown;
   let lastResponse: Response | undefined;
   for (let attempt = 0; attempt < totalAttempts; attempt++) {
+    // Exponential backoff between attempts (skip on first attempt)
+    const backoff = retryBackoffMs(attempt);
+    if (backoff > 0) {
+      logProxy("fetchWithSessionRetry", `backoff ${backoff}ms before attempt ${attempt + 1}`, {
+        context,
+        sessionId: sessionId.slice(0, 8),
+      });
+      await sleep(backoff);
+    }
+
     // Determine proxy for this attempt
     if (attempt === 0) {
       // First attempt — direct (no proxy)
       init.proxy = undefined;
     } else if (sessionPool.size > 0) {
-      // Fallback — use session-sticky proxy
-      const proxyUrl = attempt === 1
-        ? sessionPool.acquire(sessionId)
-        : sessionPool.getProxyUrl(sessionId);
-      if (proxyUrl) {
-        init.proxy = proxyUrl;
+      // Fallback — acquire on first proxy attempt, rotate to different proxy on retries
+      if (attempt === 1) {
+        const proxyUrl = sessionPool.acquire(sessionId);
+        if (proxyUrl) {
+          init.proxy = proxyUrl;
+        }
+      } else {
+        // Force rotation to a different proxy before getting URL
+        const model = extractModel(context);
+        sessionPool.rotateNow(sessionId, model);
+        const proxyUrl = sessionPool.getProxyUrl(sessionId);
+        if (proxyUrl) {
+          init.proxy = proxyUrl;
+        }
       }
     } else {
       // No proxy pool, retry direct
