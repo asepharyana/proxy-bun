@@ -11,7 +11,6 @@ import { test, expect, describe, beforeAll, afterAll } from "bun:test";
 // Note: this will also start the Bun.serve() instance, which we allow.
 import {
 	handleHealth,
-	handleDocs,
 	handleIndex,
 	getClientIP,
 } from "./index";
@@ -33,27 +32,6 @@ describe("handleHealth", () => {
 
 	test("should include CORS header", () => {
 		const response = handleHealth();
-		expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
-	});
-});
-
-describe("handleDocs", () => {
-	test("should return 200 with HTML content", () => {
-		const response = handleDocs();
-		expect(response.status).toBe(200);
-		expect(response.headers.get("Content-Type")).toContain("text/html");
-	});
-
-	test("should include Edge Proxy Relay in the HTML", async () => {
-		const response = handleDocs();
-		const text = await response.text();
-		expect(text).toContain("Edge Proxy Relay");
-		expect(text).toContain("x-relay-target");
-		expect(text).toContain("WebSocket");
-	});
-
-	test("should include CORS header", () => {
-		const response = handleDocs();
 		expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
 	});
 });

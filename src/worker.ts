@@ -117,92 +117,6 @@ function handleHealth(): Response {
 	);
 }
 
-function handleDocs(): Response {
-	const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Edge Proxy Relay — Docs</title>
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: system-ui, -apple-system, sans-serif; line-height: 1.6; color: #e1e4e8; background: #0d1117; padding: 2rem; }
-    main { max-width: 800px; margin: 0 auto; }
-    h1 { font-size: 2rem; margin-bottom: 0.5rem; color: #58a6ff; }
-    h2 { font-size: 1.25rem; margin: 2rem 0 0.75rem; color: #c9d1d9; border-bottom: 1px solid #30363d; padding-bottom: 0.25rem; }
-    p, li { color: #8b949e; }
-    code { background: #161b22; padding: 0.2em 0.4em; border-radius: 4px; font-size: 0.9em; color: #f0f6fc; }
-    pre { background: #161b22; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 0.75rem 0; border: 1px solid #30363d; }
-    pre code { background: none; padding: 0; }
-    table { width: 100%; border-collapse: collapse; margin: 0.75rem 0; }
-    th, td { text-align: left; padding: 0.5rem 0.75rem; border: 1px solid #30363d; }
-    th { background: #161b22; color: #c9d1d9; }
-    ul { padding-left: 1.5rem; margin: 0.5rem 0; }
-    .endpoint { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 1rem; margin: 1rem 0; }
-    .endpoint h3 { color: #58a6ff; font-family: monospace; margin-bottom: 0.5rem; }
-    .status { color: #3fb950; }
-    a { color: #58a6ff; }
-  </style>
-</head>
-<body>
-<main>
-  <h1>Edge Proxy Relay</h1>
-  <p>Forward HTTP requests to any target server via the <code>x-relay-target</code> header.</p>
-
-  <h2>Endpoints</h2>
-
-  <div class="endpoint">
-    <h3>GET /health</h3>
-    <p>Health check. Returns <span class="status">200 OK</span> with server status, uptime, and version.</p>
-  </div>
-
-  <div class="endpoint">
-    <h3>GET /docs</h3>
-    <p>This page.</p>
-  </div>
-
-  <div class="endpoint">
-    <h3>Any Path (Catch-all Relay)</h3>
-    <p>Send a request with the <code>x-relay-target</code> header and this proxy forwards it.</p>
-  </div>
-
-  <h2>Usage — HTTP Relay</h2>
-  <pre><code>curl -s \\
-  -H "x-relay-target: https://httpbin.org" \\
-  -H "x-relay-path: /get" \\
-  "https://your-proxy.example/any/path"</code></pre>
-  <table>
-    <tr><th>Header</th><th>Required</th><th>Description</th></tr>
-    <tr><td><code>x-relay-target</code></td><td>Yes</td><td>Base URL of the upstream (http:// or https://)</td></tr>
-    <tr><td><code>x-relay-path</code></td><td>No</td><td>Path to append (default: <code>/</code>)</td></tr>
-  </table>
-
-  <h2>Status Codes</h2>
-  <table>
-    <tr><th>Code</th><th>Meaning</th></tr>
-    <tr><td>204</td><td>CORS preflight success (OPTIONS)</td></tr>
-    <tr><td>400</td><td>Missing <code>x-relay-target</code> header</td></tr>
-    <tr><td>403</td><td>Target blocked (SSRF protection / not allowed)</td></tr>
-    <tr><td>413</td><td>Request body exceeds size limit</td></tr>
-    <tr><td>429</td><td>Rate limit exceeded</td></tr>
-    <tr><td>502</td><td>Upstream network / DNS error</td></tr>
-    <tr><td>504</td><td>Upstream timeout</td></tr>
-  </table>
-
-  <p><strong>Note:</strong> WebSocket relay is not available on this deployment.</p>
-</main>
-</body>
-</html>`;
-
-	return new Response(html, {
-		status: 200,
-		headers: {
-			"Content-Type": "text/html; charset=utf-8",
-			...getCorsHeaders(),
-		},
-	});
-}
-
 function handleIndex(): Response {
 	const html = `<!DOCTYPE html>
 <html lang="en">
@@ -215,16 +129,22 @@ function handleIndex(): Response {
     body { font-family: system-ui, -apple-system, sans-serif; line-height: 1.6; color: #e1e4e8; background: #0d1117; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
     main { text-align: center; }
     h1 { font-size: 2rem; color: #58a6ff; margin-bottom: 0.5rem; }
-    p { color: #8b949e; }
+    p { color: #8b949e; margin: 0.5rem 0; }
     a { color: #58a6ff; }
     .status { color: #3fb950; }
+    .links { margin-top: 1.5rem; display: flex; gap: 1rem; justify-content: center; }
+    .links a { text-decoration: none; background: #161b22; border: 1px solid #30363d; padding: 0.5rem 1rem; border-radius: 6px; font-size: 0.9rem; }
+    .links a:hover { background: #1c2128; border-color: #58a6ff; }
   </style>
 </head>
 <body>
 <main>
   <h1>Edge Proxy Relay</h1>
   <p class="status">Server is running</p>
-  <p><a href="/health">/health</a> &middot; <a href="/docs">/docs</a></p>
+  <div class="links">
+    <a href="/docs">Interactive Test Page</a>
+    <a href="/health">Health Check</a>
+  </div>
 </main>
 </body>
 </html>`;

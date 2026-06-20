@@ -163,89 +163,244 @@ function handleIndex(): Response {
 	});
 }
 
-function handleDocs(isWebSocketSupported: boolean): Response {
+function handleDocs(_isWebSocketSupported: boolean): Response {
 	const html = `<!DOCTYPE html>
-	<html lang="en">
-	<head>
-	  <meta charset="UTF-8">
-	  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-	  <title>Edge Proxy Relay — Docs</title>
-	  <style>
-	    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-	    body { font-family: system-ui, -apple-system, sans-serif; line-height: 1.6; color: #e1e4e8; background: #0d1117; padding: 2rem; }
-	    main { max-width: 800px; margin: 0 auto; }
-	    h1 { font-size: 2rem; margin-bottom: 0.5rem; color: #58a6ff; }
-	    h2 { font-size: 1.25rem; margin: 2rem 0 0.75rem; color: #c9d1d9; border-bottom: 1px solid #30363d; padding-bottom: 0.25rem; }
-	    p, li { color: #8b949e; }
-	    code { background: #161b22; padding: 0.2em 0.4em; border-radius: 4px; font-size: 0.9em; color: #f0f6fc; }
-	    pre { background: #161b22; padding: 1rem; border-radius: 6px; overflow-x: auto; margin: 0.75rem 0; border: 1px solid #30363d; }
-	    pre code { background: none; padding: 0; }
-	    table { width: 100%; border-collapse: collapse; margin: 0.75rem 0; }
-	    th, td { text-align: left; padding: 0.5rem 0.75rem; border: 1px solid #30363d; }
-	    th { background: #161b22; color: #c9d1d9; }
-	    ul { padding-left: 1.5rem; margin: 0.5rem 0; }
-	    .endpoint { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 1rem; margin: 1rem 0; }
-	    .endpoint h3 { color: #58a6ff; font-family: monospace; margin-bottom: 0.5rem; }
-	    .status { color: #3fb950; }
-	    a { color: #58a6ff; }
-	  </style>
-	</head>
-	<body>
-	<main>
-	  <h1>Edge Proxy Relay</h1>
-	  <p>Forward HTTP${isWebSocketSupported ? ' and WebSocket' : ''} requests to any target server via the <code>x-relay-target</code> header.</p>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Edge Proxy — API Test</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #0d1117; color: #e1e4e8; padding: 1.5rem; }
+    main { max-width: 960px; margin: 0 auto; }
+    h1 { font-size: 1.5rem; color: #58a6ff; margin-bottom: 0.25rem; }
+    .sub { color: #8b949e; margin-bottom: 1.5rem; font-size: 0.9rem; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 1rem; overflow: hidden; }
+    .card-header { padding: 0.75rem 1rem; background: #1c2128; border-bottom: 1px solid #30363d; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 0.5rem; user-select: none; }
+    .card-header:hover { background: #21262d; }
+    .card-header .method { font-size: 0.7rem; padding: 1px 6px; border-radius: 3px; font-weight: 600; text-transform: uppercase; }
+    .get { background: #1f6feb33; color: #58a6ff; }
+    .post { background: #23863633; color: #3fb950; }
+    .card-body { padding: 1rem; display: none; }
+    .card.open .card-body { display: block; }
+    .card-header .arrow { margin-left: auto; transition: transform .15s; }
+    .card.open .arrow { transform: rotate(90deg); }
+    label { display: block; font-size: 0.8rem; color: #8b949e; margin-bottom: 0.25rem; }
+    input, textarea, select { width: 100%; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; color: #e1e4e8; padding: 0.5rem 0.75rem; font-family: inherit; font-size: 0.9rem; margin-bottom: 0.75rem; }
+    input:focus, textarea:focus { border-color: #58a6ff; outline: none; }
+    textarea { min-height: 60px; resize: vertical; font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 0.8rem; }
+    textarea.code { min-height: 120px; }
+    .row { display: flex; gap: 0.75rem; }
+    .row > * { flex: 1; }
+    .btn { background: #238636; color: #fff; border: none; border-radius: 6px; padding: 0.5rem 1.25rem; font-size: 0.85rem; cursor: pointer; font-weight: 500; }
+    .btn:hover { background: #2ea043; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .output { background: #0d1117; border: 1px solid #30363d; border-radius: 4px; padding: 0.75rem; margin-top: 0.5rem; }
+    .output pre { font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 0.78rem; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow: auto; color: #c9d1d9; }
+    .output .meta { font-size: 0.75rem; color: #8b949e; margin-bottom: 0.5rem; }
+    .output .meta .status.ok { color: #3fb950; }
+    .output .meta .status.err { color: #f85149; }
+    .toast { position: fixed; bottom: 1.5rem; right: 1.5rem; background: #1c2128; border: 1px solid #30363d; border-radius: 6px; padding: 0.75rem 1rem; font-size: 0.85rem; display: none; z-index: 100; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Edge Proxy Relay — Interactive Test</h1>
+  <p class="sub">Test all endpoints from the browser. Open a card, fill in the fields, and run.</p>
 
-	  <h2>Endpoints</h2>
+  <div class="card open">
+    <div class="card-header">
+      <span class="method get">AUTH</span> API Key
+      <span class="arrow">▶</span>
+    </div>
+    <div class="card-body">
+      <label>API Key (default: <code>sk-dummy-key</code>)</label>
+      <div class="row">
+        <input type="text" id="apiKey" value="sk-dummy-key" />
+        <input type="text" id="baseUrl" value="" placeholder="(same origin)" />
+      </div>
+    </div>
+  </div>
 
-	  <div class="endpoint">
-	    <h3>GET /health</h3>
-	    <p>Health check. Returns <span class="status">200 OK</span> with server status, uptime, and version.</p>
-	  </div>
+  <div class="card open">
+    <div class="card-header" onclick="toggleCard(this)">
+      <span class="method get">GET</span> /health
+      <span class="arrow">▶</span>
+    </div>
+    <div class="card-body">
+      <button class="btn" onclick="callHealth()">Ping Health</button>
+      <div id="output-health" class="output" style="display:none"><pre></pre></div>
+    </div>
+  </div>
 
-	  <div class="endpoint">
-	    <h3>GET /docs</h3>
-	    <p>This page.</p>
-	  </div>
+  <div class="card open">
+    <div class="card-header" onclick="toggleCard(this)">
+      <span class="method get">GET</span> /v1/models
+      <span class="arrow">▶</span>
+    </div>
+    <div class="card-body">
+      <button class="btn" onclick="callModels()">List Models</button>
+      <div id="output-models" class="output" style="display:none"><pre></pre></div>
+    </div>
+  </div>
 
-	  <div class="endpoint">
-	    <h3>Any Path (Catch-all Relay)</h3>
-	    <p>Send a request with the <code>x-relay-target</code> header and this proxy forwards it.</p>
-	  </div>
+  <div class="card">
+    <div class="card-header" onclick="toggleCard(this)">
+      <span class="method post">POST</span> /v1/chat/completions
+      <span class="arrow">▶</span>
+    </div>
+    <div class="card-body">
+      <div class="row">
+        <div><label>Model</label><input type="text" id="chatModel" value="deepseek-v4-flash-free" /></div>
+        <div><label>Max Tokens</label><input type="number" id="chatMaxTokens" value="128" /></div>
+      </div>
+      <label>Messages (JSON array)</label>
+      <textarea id="chatMessages" class="code">[{"role":"user","content":"Say hello in one word"}]</textarea>
+      <label><input type="checkbox" id="chatStream" /> Stream (SSE)</label>
+      <div style="margin-top:0.5rem"><button class="btn" onclick="callChat()">Send</button></div>
+      <div id="output-chat" class="output" style="display:none"><pre></pre></div>
+    </div>
+  </div>
 
-	  <h2>Usage — HTTP Relay</h2>
-	  <pre><code>curl -s \\
-	  -H "x-relay-target: https://httpbin.org" \\
-	  -H "x-relay-path: /get" \\
-	  "https://your-proxy.example/any/path"</code></pre>
-	  <table>
-	    <tr><th>Header</th><th>Required</th><th>Description</th></tr>
-	    <tr><td><code>x-relay-target</code></td><td>Yes</td><td>Base URL of the upstream (http:// or https://)</td></tr>
-	    <tr><td><code>x-relay-path</code></td><td>No</td><td>Path to append (default: <code>/</code>)</td></tr>
-	  </table>
+  <div class="card">
+    <div class="card-header" onclick="toggleCard(this)">
+      <span class="method post">POST</span> /v1/messages (Anthropic)
+      <span class="arrow">▶</span>
+    </div>
+    <div class="card-body">
+      <div class="row">
+        <div><label>Model</label><input type="text" id="anthModel" value="deepseek-v4-flash-free" /></div>
+        <div><label>Max Tokens</label><input type="number" id="anthMaxTokens" value="256" /></div>
+      </div>
+      <label>System Prompt (optional, with cache_control)</label>
+      <textarea id="anthSystem" class="code" placeholder='[{"type":"text","text":"You are helpful.","cache_control":{"type":"ephemeral"}}]'></textarea>
+      <label>Messages (JSON)</label>
+      <textarea id="anthMessages" class="code">[{"role":"user","content":[{"type":"text","text":"Say hello in one word","cache_control":{"type":"ephemeral"}}]}]</textarea>
+      <label><input type="checkbox" id="anthStream" /> Stream (SSE)</label>
+      <div style="margin-top:0.5rem"><button class="btn" onclick="callAnthropic()">Send</button></div>
+      <div id="output-anth" class="output" style="display:none"><pre></pre></div>
+    </div>
+  </div>
 
-${isWebSocketSupported ? `
-	  <h2>Usage — WebSocket Relay</h2>
-	  <pre><code>const ws = new WebSocket("wss://your-proxy.example/relay", {
-	  headers: { "x-relay-target": "wss://echo-websocket.example" },
-	});
-	ws.onopen = () => ws.send("Hello via relay!");
-	ws.onmessage = (e) => console.log("Got:", e.data);</code></pre>
-` : `<p><strong>Note:</strong> WebSocket relay is not available on this deployment.</p>`}
+  <div class="card">
+    <div class="card-header" onclick="toggleCard(this)">
+      <span class="method post">RELAY</span> Generic HTTP Relay
+      <span class="arrow">▶</span>
+    </div>
+    <div class="card-body">
+      <label>Relay Target URL</label>
+      <input type="text" id="relayTarget" value="https://httpbin.org" />
+      <div class="row">
+        <div><label>Relay Path</label><input type="text" id="relayPath" value="/get" /></div>
+        <div><label>Method</label><select id="relayMethod"><option>GET</option><option>POST</option></select></div>
+      </div>
+      <label>Body (JSON, optional)</label>
+      <textarea id="relayBody" class="code" placeholder='{"test":true}'></textarea>
+      <div style="margin-top:0.5rem"><button class="btn" onclick="callRelay()">Send</button></div>
+      <div id="output-relay" class="output" style="display:none"><pre></pre></div>
+    </div>
+  </div>
 
-	  <h2>Status Codes</h2>
-	  <table>
-	    <tr><th>Code</th><th>Meaning</th></tr>
-	    <tr><td>204</td><td>CORS preflight success (OPTIONS)</td></tr>
-	    <tr><td>400</td><td>Missing <code>x-relay-target</code> header</td></tr>
-	    <tr><td>403</td><td>Target blocked (SSRF protection / not allowed)</td></tr>
-	    <tr><td>413</td><td>Request body exceeds size limit</td></tr>
-	    <tr><td>429</td><td>Rate limit exceeded</td></tr>
-	    <tr><td>502</td><td>Upstream network / DNS error</td></tr>
-	    <tr><td>504</td><td>Upstream timeout</td></tr>
-	  </table>
-	</main>
-	</body>
-	</html>`;
+  <div id="toast" class="toast"></div>
+</main>
+
+<script>
+function apiBase() { return document.getElementById('baseUrl').value || ''; }
+function authHeaders() {
+  const k = document.getElementById('apiKey').value || 'sk-dummy-key';
+  return { 'Authorization': 'Bearer ' + k, 'Content-Type': 'application/json' };
+}
+function toggleCard(h) { h.parentElement.classList.toggle('open'); }
+let toastTimer;
+function showToast(msg, ok) {
+  const el = document.getElementById('toast');
+  el.textContent = (ok ? '✓ ' : '✗ ') + msg;
+  el.style.display = 'block';
+  el.style.borderColor = ok ? '#3fb950' : '#f85149';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.style.display = 'none', 3000);
+}
+async function apiFetch(method, path, body) {
+  const resp = await fetch((apiBase() || '') + path, { method, headers: authHeaders(), body: body ? JSON.stringify(body) : undefined });
+  const text = await resp.text();
+  try { var data = JSON.parse(text); } catch { data = text; }
+  return { resp, data };
+}
+function showOutput(id, resp, data) {
+  const el = document.getElementById('output-' + id);
+  el.style.display = 'block';
+  const ok = resp.status >= 200 && resp.status < 300;
+  el.innerHTML = '<div class="meta"><span class="status ' + (ok ? 'ok' : 'err') + '">' + resp.status + ' ' + resp.statusText + '</span></div><pre>' + esc(typeof data === 'string' ? data : JSON.stringify(data, null, 2)).slice(0, 10000) + '</pre>';
+  showToast(resp.status + ' ' + resp.statusText, ok);
+}
+function streamOutput(id, chunk) {
+  const el = document.getElementById('output-' + id);
+  el.style.display = 'block';
+  let pre = el.querySelector('pre');
+  if (!pre) { el.innerHTML = '<div class="meta">streaming…</div><pre></pre>'; pre = el.querySelector('pre'); }
+  pre.textContent += chunk;
+  pre.scrollTop = pre.scrollHeight;
+}
+let _t;
+function elapsed() { return Date.now() - _t; }
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+async function callHealth() { _t = Date.now(); try { var r = await apiFetch('GET','/health'); showOutput('health',r.resp,r.data); } catch(e) { showOutput('health',{status:0,statusText:'Error'},e.message); showToast(e.message,0); } }
+async function callModels() { _t = Date.now(); try { var r = await apiFetch('GET','/v1/models'); showOutput('models',r.resp,r.data); } catch(e) { showOutput('models',{status:0,statusText:'Error'},e.message); showToast(e.message,0); } }
+
+async function callChat() {
+  _t = Date.now();
+  const stream = document.getElementById('chatStream').checked;
+  try { var messages = JSON.parse(document.getElementById('chatMessages').value); } catch { showToast('Invalid messages JSON',0); return; }
+  const body = { model: document.getElementById('chatModel').value || 'deepseek-v4-flash-free', messages, stream, max_tokens: parseInt(document.getElementById('chatMaxTokens').value) || 128 };
+  try {
+    if (stream) {
+      var el = document.getElementById('output-chat'); el.style.display = 'block'; el.innerHTML = '<div class="meta">streaming…</div><pre></pre>';
+      var resp = await fetch((apiBase()||'') + '/v1/chat/completions', { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) });
+      if (!resp.ok) { showOutput('chat',resp,await resp.text()); return; }
+      var reader = resp.body.getReader(), decoder = new TextDecoder(), done;
+      while (!done) { var v = await reader.read(); done = v.done; if (v.value) streamOutput('chat', decoder.decode(v.value)); }
+      showToast('stream complete',1);
+    } else { var r = await apiFetch('POST','/v1/chat/completions', body); showOutput('chat',r.resp,r.data); }
+  } catch(e) { showOutput('chat',{status:0,statusText:'Error'},e.message); showToast(e.message,0); }
+}
+
+async function callAnthropic() {
+  _t = Date.now();
+  const stream = document.getElementById('anthStream').checked;
+  try { var messages = JSON.parse(document.getElementById('anthMessages').value); } catch { showToast('Invalid messages JSON',0); return; }
+  const body = { model: document.getElementById('anthModel').value || 'deepseek-v4-flash-free', max_tokens: parseInt(document.getElementById('anthMaxTokens').value) || 256, messages, stream };
+  const sys = document.getElementById('anthSystem').value.trim();
+  if (sys) { try { body.system = JSON.parse(sys); } catch { body.system = sys; } }
+  try {
+    if (stream) {
+      var el = document.getElementById('output-anth'); el.style.display = 'block'; el.innerHTML = '<div class="meta">streaming…</div><pre></pre>';
+      var resp = await fetch((apiBase()||'') + '/v1/messages', { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) });
+      if (!resp.ok) { showOutput('anth',resp,await resp.text()); return; }
+      var reader = resp.body.getReader(), decoder = new TextDecoder(), done;
+      while (!done) { var v = await reader.read(); done = v.done; if (v.value) streamOutput('anth', decoder.decode(v.value)); }
+      showToast('stream complete',1);
+    } else { var r = await apiFetch('POST','/v1/messages', body); showOutput('anth',r.resp,r.data); }
+  } catch(e) { showOutput('anth',{status:0,statusText:'Error'},e.message); showToast(e.message,0); }
+}
+
+async function callRelay() {
+  _t = Date.now();
+  const target = document.getElementById('relayTarget').value;
+  const path = document.getElementById('relayPath').value || '/';
+  const method = document.getElementById('relayMethod').value;
+  const rawBody = document.getElementById('relayBody').value;
+  try {
+    var resp = await fetch((apiBase()||'') + '/', { method, headers: { 'x-relay-target': target, 'x-relay-path': path, ...(rawBody ? {'Content-Type':'application/json'} : {}) }, body: rawBody || undefined });
+    var text = await resp.text();
+    try { var data = JSON.parse(text); } catch { data = text; }
+    showOutput('relay', resp, data);
+  } catch(e) { showOutput('relay',{status:0,statusText:'Error'},e.message); showToast(e.message,0); }
+}
+</script>
+</body>
+</html>`;
 
 	return new Response(html, {
 		status: 200,
