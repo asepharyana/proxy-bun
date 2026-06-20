@@ -52,7 +52,7 @@
       <label>API Key (default: <code>sk-dummy-key</code>)</label>
       <div class="row">
         <input type="text" id="apiKey" value="sk-dummy-key" />
-        <input type="text" id="baseUrl" value="http://localhost:3000" placeholder="http://localhost:3000" />
+        <input type="text" id="baseUrl" value="" placeholder="(same origin — auto-detected)" />
       </div>
     </div>
   </div>
@@ -141,7 +141,7 @@
 
 <script>
 // --- Config ---
-function apiBase() { return document.getElementById('baseUrl').value || 'http://localhost:3000'; }
+function apiBase() { return document.getElementById('baseUrl').value || window.location.origin; }
 function authHeaders() {
   const k = document.getElementById('apiKey').value || 'sk-dummy-key';
   return { 'Authorization': 'Bearer ' + k, 'Content-Type': 'application/json' };
@@ -351,6 +351,10 @@ function escapeHtml(s) {
   d.textContent = s;
   return d.innerHTML;
 }
+document.addEventListener('DOMContentLoaded', () => {
+  const el = document.getElementById('baseUrl');
+  if (el && !el.value) el.value = window.location.origin;
+});
 </script>
 </body>
 </html>
