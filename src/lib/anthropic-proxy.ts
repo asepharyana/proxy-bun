@@ -11,23 +11,39 @@
  */
 
 import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
-import { MODEL_ROUTES, type BackendConfig } from "./ai-proxy";
+import { MODEL_ROUTES, listModels as listOpenAIModels, type BackendConfig } from "./ai-proxy";
 import { fetchWithRetry, fetchWithSessionRetry, SSELineBuffer, isDevMode, trackReader, releaseReader, wrapStreamWithCleanup, type FetchWithRetryResult } from "./fetch-utils";
 
 // --- Types -------------------------------------------------------------------
 
+export interface AnthropicContentBlock {
+	type: "text";
+	text: string;
+	cache_control?: { type: "ephemeral" };
+}
+
+export interface AnthropicMessage {
+	role: "user" | "assistant";
+	content: string | AnthropicContentBlock[];
+}
+
+export interface AnthropicSystemBlock {
+	type: "text";
+	text: string;
+	cache_control?: { type: "ephemeral" };
+}
+
 export interface AnthropicRequest {
 	model: string;
 	max_tokens: number;
-	messages: Array<{
-		role: "user" | "assistant";
-		content: string | Array<{ type: "text"; text: string }>;
-	}>;
+	messages: AnthropicMessage[];
 	stream?: boolean;
 	temperature?: number;
 	top_p?: number;
+	top_k?: number;
 	stop_sequences?: string[];
-	system?: string;
+	system?: string | AnthropicSystemBlock[];
+	metadata?: Record<string, unknown>;
 }
 
 interface AnthropicResponse {
@@ -61,10 +77,11 @@ export function listAnthropicModels(): string[] {
 
 interface BackendBody {
 	model: string;
-	messages: Array<{ role: string; content: string }>;
+	messages: Array<{ role: string; content: string | Array<Record<string, unknown>> }>;
 	max_tokens: number;
 	temperature?: number;
 	top_p?: number;
+	top_k?: number;
 	stream?: boolean;
 	stop?: string | string[];
 }
@@ -73,24 +90,76 @@ interface BackendBody {
  * Convert an Anthropic Messages request into the backend's expected format.
  * Uses the backend config's own adaptRequest if available, otherwise
  * produces an OpenAI-compatible body.
+ *
+ * Preserves Anthropic content blocks with cache_control so that
+ * caching directives are not lost during translation.
  */
 function anthropicToBackend(
 	anthReq: AnthropicRequest,
 	config: BackendConfig,
 	backendModel: string,
-): unknown {
-	// Flatten Anthropic content blocks to plain text
-	const messages: Array<{ role: string; content: string }> = anthReq.messages.map((m) => ({
-		role: m.role,
-		content:
-			typeof m.content === "string"
-				? m.content
-				: m.content.map((c) => c.text).join(""),
-	}));
+	anthropicVersion?: string,
+): { body: unknown; headers?: Record<string, string> } {
+	// If the backend supports Anthropic natively, pass through directly
+	if (config.anthropicPassthrough) {
+		if (config.anthropicPassthroughRequest) {
+			return config.anthropicPassthroughRequest(anthReq, backendModel);
+		}
+		const headers: Record<string, string> = {};
+		if (anthropicVersion) {
+			headers["anthropic-version"] = anthropicVersion;
+		}
+		return { body: { ...anthReq, model: backendModel }, headers };
+	}
 
-	// Prepend system prompt as a system message if present
+	// Convert Anthropic content blocks for OpenAI-compatible backend.
+	// When a content block has cache_control, we keep it as a structured
+	// content part so the backend (or downstream cache layer) can use it.
+	const messages: Array<{ role: string; content: string | Array<Record<string, unknown>> }> = anthReq.messages.map((m) => {
+		if (typeof m.content === "string") {
+			return { role: m.role, content: m.content };
+		}
+		// Check if any block has cache_control — if so, preserve as structured array
+		const hasCacheControl = m.content.some((c) => c.cache_control);
+		if (hasCacheControl) {
+			return {
+				role: m.role,
+				content: m.content.map((c) => {
+					const part: Record<string, unknown> = { type: "text", text: c.text };
+					if (c.cache_control) {
+						part.cache_control = c.cache_control;
+					}
+					return part;
+				}),
+			};
+		}
+		// No cache_control — flatten to plain text for simpler backend processing
+		return { role: m.role, content: m.content.map((c) => c.text).join("") };
+	});
+
+	// Prepend system prompt as a system message if present.
+	// Preserve cache_control on system blocks when present.
 	if (anthReq.system) {
-		messages.unshift({ role: "system", content: anthReq.system });
+		if (typeof anthReq.system === "string") {
+			messages.unshift({ role: "system", content: anthReq.system });
+		} else if (Array.isArray(anthReq.system)) {
+			const hasCacheControl = anthReq.system.some((s) => s.cache_control);
+			if (hasCacheControl) {
+				messages.unshift({
+					role: "system",
+					content: anthReq.system.map((s) => {
+						const part: Record<string, unknown> = { type: "text", text: s.text };
+						if (s.cache_control) part.cache_control = s.cache_control;
+						return part;
+					}),
+				});
+			} else {
+				messages.unshift({
+					role: "system",
+					content: anthReq.system.map((s) => s.text).join(""),
+				});
+			}
+		}
 	}
 
 	const base: BackendBody = {
@@ -99,6 +168,7 @@ function anthropicToBackend(
 		max_tokens: anthReq.max_tokens,
 		temperature: anthReq.temperature,
 		top_p: anthReq.top_p,
+		top_k: anthReq.top_k,
 		stream: anthReq.stream,
 	};
 
@@ -110,23 +180,31 @@ function anthropicToBackend(
 	}
 
 	if (config.adaptRequest) {
-		return config.adaptRequest({
-			model: backendModel,
-			messages,
-			temperature: anthReq.temperature,
-			max_tokens: anthReq.max_tokens,
-			top_p: anthReq.top_p,
-			stream: anthReq.stream,
-		});
+		return {
+			body: config.adaptRequest({
+				model: backendModel,
+				messages,
+				temperature: anthReq.temperature,
+				max_tokens: anthReq.max_tokens,
+				top_p: anthReq.top_p,
+				stream: anthReq.stream,
+			}),
+		};
 	}
 
-	return base;
+	const headers: Record<string, string> = {};
+	if (anthropicVersion) {
+		headers["anthropic-version"] = anthropicVersion;
+	}
+
+	return { body: base, headers };
 }
 
 // --- Translation: Backend -> Anthropic -----------------------------------------
 
 /**
  * Convert a backend JSON response body into Anthropic Messages format.
+ * Extracts token usage from the backend response when available.
  */
 function backendToAnthropicResponse(
 	raw: any,
@@ -135,8 +213,17 @@ function backendToAnthropicResponse(
 	const text =
 		raw.choices?.[0]?.message?.content ?? raw.content ?? raw.text ?? "";
 
+	// Extract usage from various backend formats
+	const usage = raw.usage ?? {};
+	let inputTokens = 0;
+	let outputTokens = 0;
+	if (usage.input_tokens !== undefined) inputTokens = usage.input_tokens;
+	else if (usage.prompt_tokens !== undefined) inputTokens = usage.prompt_tokens;
+	if (usage.output_tokens !== undefined) outputTokens = usage.output_tokens;
+	else if (usage.completion_tokens !== undefined) outputTokens = usage.completion_tokens;
+
 	return {
-		id: `msg_${Date.now()}`,
+		id: raw.id ?? `msg_${Date.now()}`,
 		type: "message",
 		role: "assistant",
 		content: [{ type: "text", text }],
@@ -144,8 +231,8 @@ function backendToAnthropicResponse(
 		stop_reason: raw.choices?.[0]?.finish_reason === "stop" ? "end_turn" : null,
 		stop_sequence: raw.stop_sequence ?? null,
 		usage: {
-			input_tokens: 0,
-			output_tokens: 0,
+			input_tokens: inputTokens,
+			output_tokens: outputTokens,
 		},
 	};
 }
@@ -499,6 +586,10 @@ function anthropicError(status: number, message: string, type: string): Response
  * When both `sessionPool` and `sessionId` are present the request uses
  * session-sticky proxy allocation via `fetchWithSessionRetry`; otherwise
  * the existing `fetchWithRetry` path is used (backward-compatible).
+ *
+ * The optional `anthropicVersion` parameter lets callers forward the
+ * `anthropic-version` header from the client request, enabling prompt
+ * caching and other version-gated features.
  */
 export async function handleAnthropicMessages(
 	body: unknown,
@@ -523,6 +614,15 @@ export async function handleAnthropicMessages(
 	sessionPool?: SessionProxyPool,
 	sessionId?: string,
 	ipv6Source?: string,
+	anthropicVersion?: string,
+): Promise<Response>;
+export async function handleAnthropicMessages(
+	body: unknown,
+	proxyPool?: ProxyPool,
+	sessionPool?: SessionProxyPool,
+	sessionId?: string,
+	ipv6Source?: string,
+	anthropicVersion?: string,
 ): Promise<Response> {
 	// -- Input validation -------------------------------------------------------
 	const validationError = validateAnthropicRequest(body);
@@ -543,11 +643,16 @@ export async function handleAnthropicMessages(
 
 	const { config, backendModel } = resolved;
 	const wantsStream = req.stream === true;
-	const backendBody = anthropicToBackend(req, config, backendModel);
+
+	// Translate Anthropic -> backend, preserving cache_control directives
+	// and forwarding anthropic-version when available
+	const { body: backendBody, headers: extraHeaders } = anthropicToBackend(
+		req, config, backendModel, anthropicVersion,
+	);
 
 	const init: RequestInit & { proxy?: string } = {
 		method: "POST",
-		headers: config.headers,
+		headers: { ...config.headers, ...extraHeaders },
 		body: JSON.stringify(backendBody),
 	};
 
@@ -593,7 +698,34 @@ export async function handleAnthropicMessages(
 		return anthropicError(status, genericMsg, "upstream_error");
 	}
 
-	// -- Handle streaming -------------------------------------------------------
+	// -- For native Anthropic passthrough, relay the raw backend response -------
+	if (config.anthropicPassthrough) {
+		if (wantsStream) {
+			return new Response(wrapAnthropicStreamMaybe(response.body!, sessionPool, sessionId), {
+				status: 200,
+				headers: {
+					"Content-Type": "text/event-stream",
+					"Cache-Control": "no-cache",
+					Connection: "keep-alive",
+					"Access-Control-Allow-Origin": "*",
+					"X-Accel-Buffering": "no",
+				},
+			});
+		}
+		const rawBody = await response.text();
+		if (sessionPool && sessionId) {
+			sessionPool.release(sessionId);
+		}
+		return new Response(rawBody, {
+			status: 200,
+			headers: {
+				"Content-Type": "application/json",
+				"Access-Control-Allow-Origin": "*",
+			},
+		});
+	}
+
+	// -- Handle streaming (OpenAI-compatible backend) ---------------------------
 	if (wantsStream) {
 		let transformed = transformAnthropicStream(
 			response.body!,
@@ -613,7 +745,7 @@ export async function handleAnthropicMessages(
 		});
 	}
 
-	// -- Handle non-streaming ---------------------------------------------------
+	// -- Handle non-streaming (OpenAI-compatible backend) -----------------------
 	const text = await response.text();
 	if (sessionPool && sessionId) {
 		sessionPool.release(sessionId);

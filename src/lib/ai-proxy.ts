@@ -46,6 +46,13 @@ export interface BackendConfig {
 	adaptResponse?: (raw: unknown, req: OpenAIRequest) => unknown;
 	/** Transform a backend SSE/stream line into OpenAI SSE line (or null to skip) */
 	adaptStreamLine?: (line: string, req: OpenAIRequest) => string | null;
+	/** When true, the backend natively supports Anthropic Messages API format.
+	 *  The proxy will pass through the Anthropic request directly without
+	 *  translating to OpenAI format. Requires anthropicPassthroughRequest to be set. */
+	anthropicPassthrough?: boolean;
+	/** Optional function to transform an Anthropic request for a native-Anthropic backend.
+	 *  Only used when anthropicPassthrough is true. Can add/modify headers, body fields, etc. */
+	anthropicPassthroughRequest?: (body: unknown, model: string) => { body: unknown; headers?: Record<string, string> };
 }
 
 // --- Shared aichat.org backend config (all models use the same backend) ------

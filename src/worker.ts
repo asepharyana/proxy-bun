@@ -453,7 +453,8 @@ export default {
 			if (authErr) return authErr;
 			try {
 				const body = await req.json();
-				return handleAnthropicMessages(body);
+				const anthropicVersion = req.headers.get("anthropic-version") ?? undefined;
+				return handleAnthropicMessages(body, undefined, undefined, undefined, undefined, anthropicVersion);
 			} catch {
 				return new Response(
 					JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }),

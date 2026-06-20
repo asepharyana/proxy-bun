@@ -478,7 +478,8 @@ export async function handleRequest(
 		try {
 			const body = await req.json();
 			const sessionId = crypto.randomUUID();
-			return handleAnthropicMessages(body, proxyPool!, sessionPool!, sessionId);
+			const anthropicVersion = req.headers.get("anthropic-version") ?? undefined;
+			return handleAnthropicMessages(body, proxyPool!, sessionPool!, sessionId, undefined, anthropicVersion);
 		} catch {
 			return new Response(
 				JSON.stringify({

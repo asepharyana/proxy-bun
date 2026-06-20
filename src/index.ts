@@ -552,8 +552,9 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 				const body = await req.json();
 				const sessionId = crypto.randomUUID();
 				const ipv6Source = ipv6Pool.getNext() ?? undefined;
-				console.log(`[index] POST /v1/messages session=${sessionId.slice(0, 8)} model=${(body as any).model} poolSize=${proxyPool.size} sessionPool.active=${sessionPool.activeSessions} ipv6=${ipv6Source ?? "none"}`);
-				return handleAnthropicMessages(body, proxyPool, sessionPool, sessionId, ipv6Source);
+				const anthropicVersion = req.headers.get("anthropic-version") ?? undefined;
+				console.log(`[index] POST /v1/messages session=${sessionId.slice(0, 8)} model=${(body as any).model} poolSize=${proxyPool.size} sessionPool.active=${sessionPool.activeSessions} ipv6=${ipv6Source ?? "none"} anthropic-version=${anthropicVersion ?? "none"}`);
+				return handleAnthropicMessages(body, proxyPool, sessionPool, sessionId, ipv6Source, anthropicVersion);
 			} catch {
 				return new Response(
 					JSON.stringify({
