@@ -290,9 +290,9 @@ function handleDocs(_isWebSocketSupported: boolean): Response {
     </div>
     <div class="card-body">
       <label>Relay Target URL</label>
-      <input type="text" id="relayTarget" value="https://httpbin.org" />
+      <input type="text" id="relayTarget" value="https://api.ipify.org/?format=json" />
       <div class="row">
-        <div><label>Relay Path</label><input type="text" id="relayPath" value="/get" /></div>
+        <div><label>Relay Path</label><input type="text" id="relayPath" value="/" /></div>
         <div><label>Method</label><select id="relayMethod"><option>GET</option><option>POST</option></select></div>
       </div>
       <label>Body (JSON, optional)</label>
