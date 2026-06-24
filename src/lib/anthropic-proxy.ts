@@ -280,6 +280,14 @@ function accumulateSSEText(sseBody: string): string {
 			const parsed = JSON.parse(raw);
 			if (parsed.type === "text-delta" && parsed.delta) {
 				accumulated += parsed.delta;
+				continue;
+			}
+			// Handle OpenAI-format SSE with reasoning_content
+			const delta = parsed.choices?.[0]?.delta;
+			if (delta?.reasoning_content) {
+				accumulated += `<thinking>${delta.reasoning_content}</thinking>`;
+			} else if (delta?.content) {
+				accumulated += delta.content;
 			}
 		} catch {
 			// skip unparseable lines
@@ -295,6 +303,9 @@ function accumulateSSEText(sseBody: string): string {
  *   - Claude Code format: { "type": "text-delta", "delta": "..." }
  *   - OpenAI format:     { "choices": [{ "delta": { "content": "..." } }] }
  *   - Generic JSON:      { "content": "..." } or { "text": "..." }
+ *
+ * Also handles reasoning_content (e.g., DeepSeek model output) by wrapping
+ * it in <thinking> tags so it is preserved in the Anthropic stream output.
  */
 function extractTextFromSSE(parsed: any): string | null {
 	if (parsed == null) return null;
@@ -308,9 +319,21 @@ function extractTextFromSSE(parsed: any): string | null {
 		}
 	}
 
-	const openai = parsed.choices?.[0]?.delta?.content ??
-		parsed.choices?.[0]?.text;
-	if (openai) return openai;
+	const delta = parsed.choices?.[0]?.delta;
+	const reasoningDelta = delta?.reasoning_content;
+	const contentDelta = delta?.content;
+	const textFallback = parsed.choices?.[0]?.text;
+
+	// When the delta has reasoning_content but no content, wrap in <thinking> tags
+	if (reasoningDelta && !contentDelta) {
+		return `<thinking>${reasoningDelta}</thinking>`;
+	}
+	// When both exist, prepend thinking and follow with text content
+	if (reasoningDelta && contentDelta) {
+		return `<thinking>${reasoningDelta}</thinking>${contentDelta}`;
+	}
+	if (contentDelta) return contentDelta;
+	if (textFallback) return textFallback;
 
 	if (typeof parsed.content === "string") return parsed.content;
 	if (typeof parsed.text === "string") return parsed.text;
@@ -907,6 +930,13 @@ export async function handleAnthropicMessages(
 		parsed = JSON.parse(text);
 	} catch {
 		parsed = { content: text };
+	}
+
+	// Apply backend adaptResponse if available (handles double-nested responses
+	// from providers like opencode.ai that wrap the real response as a JSON
+	// string inside choices[0].message.content).
+	if (config.adaptResponse && typeof parsed === "object" && parsed !== null) {
+		parsed = config.adaptResponse(parsed, req as any) ?? parsed;
 	}
 
 	const adapted = backendToAnthropicResponse(parsed, req.model);
