@@ -41,7 +41,6 @@ export interface AnthropicRequest {
 	temperature?: number;
 	top_p?: number;
 	top_k?: number;
-	stream?: boolean;
 	stop_sequences?: string[];
 	system?: string | AnthropicSystemBlock[];
 	metadata?: Record<string, unknown>;
@@ -429,6 +428,108 @@ interface OutputCounter {
 	chars: number;
 }
 
+// --- Stream state machine helpers ---------------------------------------------
+
+/**
+ * Emit message_start and content_block_start events.
+ */
+function emitInitEvents(
+	controller: ReadableStreamDefaultController,
+	encoder: TextEncoder,
+	model: string,
+	messageId: string,
+	usage: AnthropicResponse["usage"],
+): void {
+	controller.enqueue(encoder.encode(
+		`event: message_start\ndata: ${JSON.stringify({
+			type: "message_start",
+			message: { id: messageId, type: "message", role: "assistant", content: [], model, stop_reason: null, stop_sequence: null, usage },
+		})}\n\n`,
+	));
+	controller.enqueue(encoder.encode(
+		'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+	));
+}
+
+/**
+ * Emit content_block_stop + message_delta + message_stop and close.
+ * Estimates output tokens from char count as fallback.
+ */
+function emitDoneEvents(
+	controller: ReadableStreamDefaultController,
+	encoder: TextEncoder,
+	usage: AnthropicResponse["usage"],
+	outputCounter: OutputCounter,
+): void {
+	if (usage.output_tokens === 0 && outputCounter.chars > 0) {
+		usage.output_tokens = Math.max(1, Math.round(outputCounter.chars / 4));
+	}
+
+	controller.enqueue(encoder.encode('event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'));
+	controller.enqueue(encoder.encode(
+		`event: message_delta\ndata: ${JSON.stringify({
+			type: "message_delta",
+			delta: { stop_reason: "end_turn", stop_sequence: null },
+			usage: { output_tokens: usage.output_tokens },
+		})}\n\n`,
+	));
+	controller.enqueue(encoder.encode('event: message_stop\ndata: {"type":"message_stop"}\n\n'));
+	controller.close();
+}
+
+/**
+ * Emit error event and close — dev mode includes the error detail.
+ */
+function emitErrorEvent(
+	controller: ReadableStreamDefaultController,
+	encoder: TextEncoder,
+	err: unknown,
+): void {
+	if (isDevMode()) {
+		controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: String(err) })}\n\n`));
+	} else {
+		controller.enqueue(encoder.encode('event: error\ndata: {"error":"Stream error"}\n\n'));
+	}
+	controller.close();
+}
+
+/**
+ * Process one chunk from the upstream reader through the SSE line buffer
+ * and emit adapted Anthropic SSE events for each complete line.
+ * Returns true if the stream is done (reader returned done=true).
+ */
+async function processStreamChunk(
+	reader: ReadableStreamDefaultReader,
+	lineBuffer: SSELineBuffer,
+	decoder: TextDecoder,
+	controller: ReadableStreamDefaultController,
+	encoder: TextEncoder,
+	model: string,
+	config: BackendConfig,
+	usage: AnthropicResponse["usage"],
+	outputCounter: OutputCounter,
+): Promise<boolean> {
+	const { done, value } = await reader.read();
+	if (done) {
+		// Flush remaining buffered data
+		const remaining = lineBuffer.flush();
+		if (remaining.length > 0) {
+			const adapted = backendLineToAnthropicSSE(remaining, model, config, usage, outputCounter);
+			if (adapted) controller.enqueue(encoder.encode(adapted + "\n\n"));
+		}
+		return true;
+	}
+
+	const chunk = decoder.decode(value, { stream: true });
+	const lines = lineBuffer.add(chunk);
+
+	for (const line of lines) {
+		const adapted = backendLineToAnthropicSSE(line, model, config, usage, outputCounter);
+		if (adapted) controller.enqueue(encoder.encode(adapted + "\n\n"));
+	}
+	return false;
+}
+
 // --- Stream transformer --------------------------------------------------------
 
 function transformAnthropicStream(
@@ -437,41 +538,26 @@ function transformAnthropicStream(
 	config: BackendConfig,
 ): ReadableStream {
 	const reader = trackReader(body.getReader() as any as ReadableStreamDefaultReader);
-	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
+	const decoder = new TextDecoder();
 	const lineBuffer = new SSELineBuffer();
 
 	let phase: "init" | "block" | "done" = "init";
-	let messageId = `msg_${Date.now()}`;
 	const outputCounter: OutputCounter = { chars: 0 };
+	const usage: AnthropicResponse["usage"] = { input_tokens: 0, output_tokens: 0 };
 
-	// Accumulate usage from backend SSE lines (some backends include usage
-	// in their SSE data). Start with zeros, update as we parse lines.
-	const usage: AnthropicResponse["usage"] = {
-		input_tokens: 0,
-		output_tokens: 0,
-	};
-
-	// SSE keepalive: send a comment every 15s to prevent LB/proxy timeout
 	let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
 	const KEEPALIVE_INTERVAL_MS = 15_000;
 
 	function startKeepalive(controller: ReadableStreamDefaultController) {
 		if (keepaliveTimer) return;
 		keepaliveTimer = setInterval(() => {
-			try {
-				controller.enqueue(encoder.encode(": keepalive\n\n"));
-			} catch {
-				if (keepaliveTimer) clearInterval(keepaliveTimer);
-			}
+			try { controller.enqueue(encoder.encode(": keepalive\n\n")); } catch { stopKeepalive(); }
 		}, KEEPALIVE_INTERVAL_MS);
 	}
 
 	function stopKeepalive() {
-		if (keepaliveTimer) {
-			clearInterval(keepaliveTimer);
-			keepaliveTimer = null;
-		}
+		if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null; }
 	}
 
 	return new ReadableStream({
@@ -481,120 +567,35 @@ function transformAnthropicStream(
 
 				if (phase === "init") {
 					phase = "block";
-					messageId = `msg_${Date.now()}`;
-
-					const startEvent = `event: message_start\ndata: ${JSON.stringify({
-						type: "message_start",
-						message: {
-							id: messageId,
-							type: "message",
-							role: "assistant",
-							content: [],
-							model,
-							stop_reason: null,
-							stop_sequence: null,
-							usage,
-						},
-					})}`;
-					controller.enqueue(encoder.encode(startEvent + "\n\n"));
-
-					const blockStart = `event: content_block_start\ndata: ${JSON.stringify({
-						type: "content_block_start",
-						index: 0,
-						content_block: { type: "text", text: "" },
-					})}`;
-					controller.enqueue(encoder.encode(blockStart + "\n\n"));
+					emitInitEvents(controller, encoder, model, `msg_${Date.now()}`, usage);
 				}
 
-				while (phase === "block") {
-					const BATCH_SIZE = 8;
-					let chunksProcessed = 0;
+				const BATCH_SIZE = 8;
+				let chunksProcessed = 0;
 
-					while (phase === "block") {
-						const { done, value } = await reader.read();
-						if (done) {
-							stopKeepalive();
-							releaseReader(reader);
-							const remaining = lineBuffer.flush();
-							if (remaining.length > 0) {
-								const adapted = backendLineToAnthropicSSE(remaining, model, config, usage, outputCounter);
-								if (adapted) {
-									controller.enqueue(encoder.encode(adapted + "\n\n"));
-								}
-							}
-							phase = "done";
-							break;
-						}
-
-						const chunk = decoder.decode(value, { stream: true });
-						const lines = lineBuffer.add(chunk);
-
-						for (const line of lines) {
-							const adapted = backendLineToAnthropicSSE(line, model, config, usage, outputCounter);
-							if (adapted) {
-								controller.enqueue(encoder.encode(adapted + "\n\n"));
-							}
-						}
-
-						chunksProcessed++;
-						if (chunksProcessed >= BATCH_SIZE) {
-							chunksProcessed = 0;
-							await new Promise((r) => setTimeout(r, 0));
-							return;
-						}
+				while (phase === "block" && chunksProcessed < BATCH_SIZE) {
+					const isDone = await processStreamChunk(reader, lineBuffer, decoder, controller, encoder, model, config, usage, outputCounter);
+					if (isDone) {
+						stopKeepalive();
+						releaseReader(reader);
+						phase = "done";
+						break;
 					}
+					chunksProcessed++;
+				}
+
+				if (chunksProcessed >= BATCH_SIZE) {
+					await new Promise((r) => setTimeout(r, 0));
+					return;
 				}
 
 				if (phase === "done") {
-					phase = "done";
-
-					// Estimate output tokens from char count as fallback
-					// when the backend doesn't report usage in SSE lines.
-					if (usage.output_tokens === 0 && outputCounter.chars > 0) {
-						usage.output_tokens = Math.max(1, Math.round(outputCounter.chars / 4));
-					}
-
-					controller.enqueue(
-						encoder.encode(
-							'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
-						),
-					);
-
-					controller.enqueue(
-						encoder.encode(
-							`event: message_delta\ndata: ${JSON.stringify({
-								type: "message_delta",
-								delta: { stop_reason: "end_turn", stop_sequence: null },
-								usage: { output_tokens: usage.output_tokens },
-							})}\n\n`,
-						),
-					);
-
-					controller.enqueue(
-						encoder.encode(
-							'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-						),
-					);
-
-					controller.close();
+					emitDoneEvents(controller, encoder, usage, outputCounter);
 				}
 			} catch (err) {
 				stopKeepalive();
 				releaseReader(reader);
-				if (isDevMode()) {
-					controller.enqueue(
-						encoder.encode(
-							`event: error\ndata: ${JSON.stringify({ error: String(err) })}\n\n`,
-						),
-					);
-				} else {
-					controller.enqueue(
-						encoder.encode(
-							'event: error\ndata: {"error":"Stream error"}\n\n',
-						),
-					);
-				}
-				controller.close();
+				emitErrorEvent(controller, encoder, err);
 			}
 		},
 		cancel() {
@@ -687,6 +688,73 @@ function anthropicError(status: number, message: string, type: string): Response
 	);
 }
 
+/**
+ * Handle a backend error response: parse upstream body, release session, return Anthropic error.
+ */
+async function handleUpstreamError(
+	response: Response,
+	sessionPool?: SessionProxyPool,
+	sessionId?: string,
+): Promise<Response> {
+	const status = response.status;
+	let upstreamMsg = status >= 500 ? "Upstream server error" : "Upstream rejected request";
+	try {
+		const errBody = await response.text();
+		if (errBody) {
+			const errJson = JSON.parse(errBody);
+			if (errJson?.error?.message) upstreamMsg = errJson.error.message;
+			else if (errJson?.type === "error" && errJson?.error?.message) upstreamMsg = errJson.error.message;
+			else if (errJson?.message) upstreamMsg = errJson.message;
+			else if (typeof errBody === "string" && errBody.length < 500) upstreamMsg = errBody;
+		}
+	} catch { /* keep default */ }
+	if (sessionPool && sessionId) sessionPool.release(sessionId);
+	return anthropicError(status, upstreamMsg, "upstream_error");
+}
+
+/** Build streaming response headers with CORS and cache forwarding. */
+function buildStreamHeaders(response: Response): Record<string, string> {
+	const h: Record<string, string> = {
+		"Content-Type": "text/event-stream", "Cache-Control": "no-cache",
+		Connection: "keep-alive", "Access-Control-Allow-Origin": "*", "X-Accel-Buffering": "no",
+	};
+	forwardCacheHeaders(response, h);
+	return h;
+}
+
+/** Build JSON response headers with CORS and cache forwarding. */
+function buildJsonHeaders(response: Response): Record<string, string> {
+	const h: Record<string, string> = {
+		"Content-Type": "application/json", "Access-Control-Allow-Origin": "*",
+	};
+	forwardCacheHeaders(response, h);
+	return h;
+}
+
+/**
+ * Handle a non-streaming backend response that came back in SSE format
+ * (it happens when the backend only supports SSE but we asked for non-stream).
+ * Accumulates the text deltas into a single Anthropic response.
+ */
+function handleBackendSSEExtract(
+	text: string,
+	model: string,
+): AnthropicResponse | null {
+	if (!text.trimStart().startsWith("data: ")) return null;
+	const accumulated = accumulateSSEText(text);
+	if (!accumulated) return null;
+	return {
+		id: `msg_${Date.now()}`,
+		type: "message",
+		role: "assistant",
+		content: [{ type: "text", text: accumulated }],
+		model,
+		stop_reason: "end_turn",
+		stop_sequence: null,
+		usage: { input_tokens: 0, output_tokens: 0 },
+	};
+}
+
 // --- Main handler --------------------------------------------------------------
 
 /**
@@ -758,11 +826,9 @@ export async function handleAnthropicMessages(
 	const wantsStream = req.stream === true;
 
 	// Default anthropic-version to 2023-06-01 (required for prompt caching).
-	// The client can override via the anthropic-version header.
 	const version = anthropicVersion || "2023-06-01";
 
-	// Translate Anthropic -> backend, preserving cache_control directives
-	// and forwarding anthropic-version when available
+	// Translate Anthropic -> backend
 	const { body: backendBody, headers: extraHeaders } = anthropicToBackend(
 		req, config, backendModel, version,
 	);
@@ -782,23 +848,15 @@ export async function handleAnthropicMessages(
 			: await fetchWithRetry(url, init, proxyPool, `anthropic:${req.model}`, ipv6Source);
 
 	if (result.errorClassification) {
-		if (sessionPool && sessionId) {
-			sessionPool.release(sessionId);
-		}
+		if (sessionPool && sessionId) sessionPool.release(sessionId);
 		return new Response(
 			JSON.stringify({
 				type: "error",
-				error: {
-					message: result.errorClassification.message,
-					type: "server_error",
-				},
+				error: { message: result.errorClassification.message, type: "server_error" },
 			}),
 			{
 				status: result.errorClassification.status,
-				headers: {
-					"Content-Type": "application/json",
-					"Access-Control-Allow-Origin": "*",
-				},
+				headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
 			},
 		);
 	}
@@ -807,124 +865,43 @@ export async function handleAnthropicMessages(
 
 	// -- Handle error responses from backend ------------------------------------
 	if (!response.ok) {
-		const status = response.status;
-		// Read the upstream error body so clients see the actual rejection reason,
-		// not just a generic "Upstream rejected request" message.
-		let upstreamMsg = status >= 500 ? "Upstream server error" : "Upstream rejected request";
-		try {
-			const errBody = await response.text();
-			if (errBody) {
-				const errJson = JSON.parse(errBody);
-				// OpenAI-style: { error: { message, type } }
-				if (errJson?.error?.message) {
-					upstreamMsg = errJson.error.message;
-				}
-				// Anthropic-style: { type: "error", error: { message, type } }
-				else if (errJson?.type === "error" && errJson?.error?.message) {
-					upstreamMsg = errJson.error.message;
-				}
-				// Plain JSON with message field
-				else if (errJson?.message) {
-					upstreamMsg = errJson.message;
-				}
-				// Raw text error body
-				else if (typeof errBody === "string" && errBody.length < 500) {
-					upstreamMsg = errBody;
-				}
-			}
-		} catch {
-			// Could not read error body — keep generic message
-		}
-		if (sessionPool && sessionId) {
-			sessionPool.release(sessionId);
-		}
-		return anthropicError(status, upstreamMsg, "upstream_error");
+		return handleUpstreamError(response, sessionPool, sessionId);
 	}
 
 	// -- For native Anthropic passthrough, relay the raw backend response -------
 	if (config.anthropicPassthrough) {
 		if (wantsStream) {
-			const headers: Record<string, string> = {
-				"Content-Type": "text/event-stream",
-				"Cache-Control": "no-cache",
-				Connection: "keep-alive",
-				"Access-Control-Allow-Origin": "*",
-				"X-Accel-Buffering": "no",
-			};
-			forwardCacheHeaders(response, headers);
 			return new Response(wrapAnthropicStreamMaybe(response.body!, sessionPool, sessionId), {
 				status: 200,
-				headers,
+				headers: buildStreamHeaders(response),
 			});
 		}
 		const rawBody = await response.text();
-		if (sessionPool && sessionId) {
-			sessionPool.release(sessionId);
-		}
-		const headers: Record<string, string> = {
-			"Content-Type": "application/json",
-			"Access-Control-Allow-Origin": "*",
-		};
-		forwardCacheHeaders(response, headers);
-		return new Response(rawBody, { status: 200, headers });
+		if (sessionPool && sessionId) sessionPool.release(sessionId);
+		return new Response(rawBody, { status: 200, headers: buildJsonHeaders(response) });
 	}
 
 	// -- Handle streaming (OpenAI-compatible backend) ---------------------------
 	if (wantsStream) {
-		let transformed = transformAnthropicStream(
-			response.body!,
-			req.model,
-			config,
-		);
+		let transformed = transformAnthropicStream(response.body!, req.model, config);
 		transformed = wrapAnthropicStreamMaybe(transformed, sessionPool, sessionId);
-		const headers: Record<string, string> = {
-			"Content-Type": "text/event-stream",
-			"Cache-Control": "no-cache",
-			Connection: "keep-alive",
-			"Access-Control-Allow-Origin": "*",
-			"X-Accel-Buffering": "no",
-		};
-		forwardCacheHeaders(response, headers);
-		return new Response(transformed, { status: 200, headers });
+		return new Response(transformed, { status: 200, headers: buildStreamHeaders(response) });
 	}
 
 	// -- Handle non-streaming (OpenAI-compatible backend) -----------------------
 	const text = await response.text();
-	if (sessionPool && sessionId) {
-		sessionPool.release(sessionId);
+	if (sessionPool && sessionId) sessionPool.release(sessionId);
+
+	// Backend returned SSE even though we didn't ask for stream
+	const sseAdapted = handleBackendSSEExtract(text, req.model);
+	if (sseAdapted) {
+		return new Response(JSON.stringify(sseAdapted), {
+			status: 200,
+			headers: buildJsonHeaders(response),
+		});
 	}
 
-	const buildBaseHeaders = (): Record<string, string> => {
-		const h: Record<string, string> = {
-			"Content-Type": "application/json",
-			"Access-Control-Allow-Origin": "*",
-		};
-		forwardCacheHeaders(response, h);
-		return h;
-	};
-
-	if (text.trimStart().startsWith("data: ")) {
-		const accumulated = accumulateSSEText(text);
-		if (accumulated) {
-			return new Response(
-				JSON.stringify({
-					id: `msg_${Date.now()}`,
-					type: "message",
-					role: "assistant",
-					content: [{ type: "text", text: accumulated }],
-					model: req.model,
-					stop_reason: "end_turn",
-					stop_sequence: null,
-					usage: { input_tokens: 0, output_tokens: 0 },
-				}),
-				{
-					status: 200,
-					headers: buildBaseHeaders(),
-				},
-			);
-		}
-	}
-
+	// Parse JSON and adapt
 	let parsed: any;
 	try {
 		parsed = JSON.parse(text);
@@ -933,10 +910,9 @@ export async function handleAnthropicMessages(
 	}
 
 	const adapted = backendToAnthropicResponse(parsed, req.model);
-
 	return new Response(JSON.stringify(adapted), {
 		status: 200,
-		headers: buildBaseHeaders(),
+		headers: buildJsonHeaders(response),
 	});
 }
 

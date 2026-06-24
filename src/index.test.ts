@@ -5,15 +5,15 @@
  * bypassing the HTTP server layer.
  */
 
-import { test, expect, describe, beforeAll, afterAll } from "bun:test";
+import { test, expect, describe } from "bun:test";
 
 // Import handler functions directly from index.ts
 // Note: this will also start the Bun.serve() instance, which we allow.
 import {
 	handleHealth,
 	handleIndex,
-	getClientIP,
-} from "./index";
+	getClientIPFromServer as getClientIP,
+} from "./lib/router";
 
 describe("handleHealth", () => {
 	test("should return 200 with JSON body", async () => {

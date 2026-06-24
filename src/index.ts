@@ -1,93 +1,47 @@
 /**
- * Edge Proxy Relay — Pure Bun HTTP + WebSocket relay server.
+ * Edge Proxy Relay — Standalone Bun.serve() entry point.
  *
- * Forwards requests/responses to a target URL specified via the
- * `x-relay-target` request header.  Supports WebSocket upgrades
- * when the target uses `ws://` or `wss://`.
- *
- * --- Environment Variables ----------------------------------------------------
- * PORT                — Server listen port (default: 3000)
- * RELAY_TIMEOUT_MS    — Upstream fetch timeout (default: 30_000)
- * BODY_MAX_BYTES      — Maximum accepted request body (default: 1_048_576)
- * RATE_LIMIT_MAX      — Max requests per sliding window (default: 100)
- * RATE_LIMIT_WINDOW_MS— Sliding window duration  (default: 60_000)
- * CORS_ORIGIN         — Allowed CORS origin (default: *)
- * NODE_ENV            — Set to "production" to disable dev features
+ * Thin wrapper around the shared router in src/lib/router.ts.
+ * Adds:
+ *   - Bun.serve() bindings
+ *   - WebSocket relay support
+ *   - IPv6 source rotation
+ *   - Proxy pool file loading
+ *   - Graceful shutdown
  */
 
 import {
 	normalizeTargetUrl,
 	isAllowedTarget,
-	filterRequestHeaders,
-	buildRelayRequest,
-	createRelayResponse,
 	createErrorResponse,
-	createCorsPreflightResponse,
-	getCorsHeaders,
 	setSsrfDnsCheck,
 } from "./lib/relay-utils";
 
-import { checkBodySize } from "./middleware/body-limiter";
-import { createRateLimiter } from "./middleware/rate-limiter";
-import { logRelayEvent } from "./middleware/logger";
-import { ProxyPool, SessionProxyPool } from "./lib/proxy-pool";
+import {
+	handleHealth,
+	handleIndex,
+	getClientIPFromServer as getClientIP,
+	getSharedProxyPool,
+} from "./lib/router";
+import type { RouterEnv } from "./lib/router";
+
 import { IPv6SourcePool } from "./lib/ipv6-pool";
-import { handleChatCompletion, listModels } from "./lib/ai-proxy";
-import { handleAnthropicMessages } from "./lib/anthropic-proxy";
-import { fetchWithRetry, closeAllActiveReaders, isDevMode } from "./lib/fetch-utils";
+import { closeAllActiveReaders, isDevMode } from "./lib/fetch-utils";
 
 import type { Server, ServerWebSocket } from "bun";
 
 // --- Configuration ------------------------------------------------------------
 
+const RELAY_VERSION = "1.0.0";
 const PORT = Number.parseInt(process.env.PORT ?? "3000", 10);
 const HOST = process.env.HOST ?? "::";
-const RELAY_TIMEOUT_MS = Number.parseInt(
-	process.env.RELAY_TIMEOUT_MS ?? "30000",
-	10,
-);
-const SERVER_START_TIME = Date.now();
-const RELAY_VERSION = "1.0.0";
-
-// --- API Key Authentication ---------------------------------------------------
-
-const API_KEY = process.env.API_KEY ?? "sk-dummy-key";
-
-function requireAuth(req: Request): Response | null {
-	const header = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? "";
-	const key = header.replace(/^Bearer\s+/i, "").trim();
-	if (key === API_KEY) return null;
-	return new Response(
-		JSON.stringify({ error: { message: "Unauthorized", type: "auth_error" } }),
-		{
-			status: 401,
-			headers: { "Content-Type": "application/json", ...getCorsHeaders() },
-		},
-	);
-}
-
-// --- Middleware instances (singletons) ----------------------------------------
-
-const rateLimiter = createRateLimiter({
-	maxRequests: Number.parseInt(process.env.RATE_LIMIT_MAX ?? "100", 10),
-	windowMs: Number.parseInt(
-		process.env.RATE_LIMIT_WINDOW_MS ?? "60000",
-		10,
-	),
-});
 
 // --- Proxy pool (optional) ----------------------------------------------------
 
-const proxyPool = new ProxyPool();
+const proxyPool = getSharedProxyPool();
 proxyPool.tryLoad(
 	process.env.PROXY_FILE || process.env.PROXY_LIST || "./proxy.txt",
 );
-
-// Session-aware proxy pool wrapping the base pool.
-// Sessions are per-request and short-lived — each streaming request gets
-// a random session ID so the same proxy is reused for the entire stream.
-const sessionPool = new SessionProxyPool(proxyPool);
-sessionPool.setFailureThreshold(3);
 
 // --- IPv6 source pool (optional) ----------------------------------------------
 
@@ -104,264 +58,21 @@ if (process.env.SSRF_DNS_CHECK === "true") {
 	console.log("[relay] SSRF DNS rebinding protection enabled");
 }
 
+// --- Env bag for router (falls through to process.env) ------------------------
+
+const routerEnv: RouterEnv = {};
+
 // --- WebSocket relay data type -----------------------------------------------
 
 interface WSRelayData {
 	target: string;
 	relayPath: string;
 	upstream?: WebSocket;
-	/** Set when client buffer exceeds threshold — stops forwarding upstream data */
 	paused?: boolean;
 }
 
-// --- Route handlers ----------------------------------------------------------
+// --- WebSocket relay ---------------------------------------------------------
 
-/** Health check endpoint: returns status, uptime, and version. */
-function handleHealth(): Response {
-	return new Response(
-		JSON.stringify({
-			status: "ok",
-			uptime: Date.now() - SERVER_START_TIME,
-			version: RELAY_VERSION,
-		}),
-		{
-			status: 200,
-			headers: {
-				"Content-Type": "application/json",
-				...getCorsHeaders(),
-			},
-		},
-	);
-}
-
-/** Status page shown at the root `/`. */
-function handleIndex(): Response {
-	const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Edge Proxy Relay</title>
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: system-ui, -apple-system, sans-serif; line-height: 1.6; color: #e1e4e8; background: #0d1117; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-    main { text-align: center; }
-    h1 { font-size: 2rem; color: #58a6ff; margin-bottom: 0.5rem; }
-    p { color: #8b949e; margin: 0.5rem 0; }
-    a { color: #58a6ff; }
-    .status { color: #3fb950; }
-    .links { margin-top: 1.5rem; display: flex; gap: 1rem; justify-content: center; }
-    .links a { text-decoration: none; background: #161b22; border: 1px solid #30363d; padding: 0.5rem 1rem; border-radius: 6px; font-size: 0.9rem; }
-    .links a:hover { background: #1c2128; border-color: #58a6ff; }
-  </style>
-</head>
-<body>
-<main>
-  <h1>Edge Proxy Relay</h1>
-  <p class="status">Server is running</p>
-  <div class="links">
-    <a href="/docs">Interactive Test Page</a>
-    <a href="/health">Health Check</a>
-  </div>
-</main>
-</body>
-</html>`;
-
-	return new Response(html, {
-		status: 200,
-		headers: {
-			"Content-Type": "text/html; charset=utf-8",
-		},
-	});
-}
-
-// --- HTTP Relay Logic -------------------------------------------------------
-
-/**
- * Get the client IP address from the request.
- * Tries `x-forwarded-for` first, then `cf-connecting-ip`, then falls back
- * to the direct connection address from `server.requestIP()`.
- */
-function getClientIP(
-	req: Request,
-	ipGetter: { requestIP(req: Request): { address: string } | null },
-): string {
-	const forwarded = req.headers.get("x-forwarded-for");
-	if (forwarded) {
-		const first = forwarded.split(",")[0]?.trim();
-		if (first) return first;
-	}
-
-	const cfIp = req.headers.get("cf-connecting-ip");
-	if (cfIp) return cfIp;
-
-	const remote = ipGetter.requestIP(req);
-	if (remote) return remote.address;
-
-	return "unknown";
-}
-
-/**
- * Core HTTP relay handler.
- *
- * Expects `x-relay-target` header to determine the upstream URL.
- * Applies middleware (body size check, rate limiting, logging) and
- * proxies the request while filtering sensitive headers.
- */
-async function handleRelay(
-	req: Request,
-	ipGetter: { requestIP(req: Request): { address: string } | null },
-): Promise<Response> {
-	const startTime = performance.now();
-	const method = req.method;
-	const clientIP = getClientIP(req, ipGetter);
-	const requestUrl = req.url;
-
-	// -- Pre-flight CORS --------------------------------------------------------
-	if (method === "OPTIONS") {
-		return createCorsPreflightResponse();
-	}
-
-	// -- Middleware: Body size check -------------------------------------------
-	const bodyError = checkBodySize(req);
-	if (bodyError) {
-		logRelayEvent({
-			method,
-			url: requestUrl,
-			status: bodyError.status,
-			durationMs: Math.round(performance.now() - startTime),
-			ip: clientIP,
-		});
-		return bodyError;
-	}
-
-	// -- Middleware: Rate limiting ---------------------------------------------
-	const rateCheck = await rateLimiter.checkAsync(clientIP);
-	if (!rateCheck.allowed) {
-		logRelayEvent({
-			method,
-			url: requestUrl,
-			status: 429,
-			durationMs: Math.round(performance.now() - startTime),
-			error: "rate_limit_exceeded",
-			ip: clientIP,
-		});
-		return new Response(
-			JSON.stringify({
-				error: true,
-				code: "RATE_LIMITED",
-				message: "Too many requests",
-				retryAfterMs: rateCheck.retryAfterMs,
-			}),
-			{
-				status: 429,
-				headers: {
-					"Content-Type": "application/json",
-					...getCorsHeaders(),
-					"Retry-After": String(
-						Math.ceil((rateCheck.retryAfterMs ?? 60_000) / 1000),
-					),
-				},
-			},
-		);
-	}
-
-	// -- Extract relay parameters from headers ---------------------------------
-	const target = req.headers.get("x-relay-target");
-	const relayPath = req.headers.get("x-relay-path") ?? "/";
-
-	// -- SSRF: Normalize and validate target URL --------------------------------
-	const targetUrl = normalizeTargetUrl(target, relayPath);
-	if (!targetUrl) {
-		logRelayEvent({
-			method,
-			url: requestUrl,
-			status: 400,
-			durationMs: Math.round(performance.now() - startTime),
-			error: "missing_target_header",
-			ip: clientIP,
-		});
-		return createErrorResponse({
-			code: "INVALID_TARGET",
-			status: 400,
-			message: "Missing or invalid x-relay-target header",
-		});
-	}
-
-	if (!isAllowedTarget(targetUrl)) {
-		logRelayEvent({
-			method,
-			url: requestUrl,
-			status: 403,
-			durationMs: Math.round(performance.now() - startTime),
-			error: "target_not_allowed",
-			ip: clientIP,
-		});
-		return createErrorResponse({
-			code: "SSRF_BLOCKED",
-			status: 403,
-			message: "Target domain not allowed",
-		});
-	}
-
-	// -- Build the upstream request ---------------------------------------------
-	const filteredHeaders = filterRequestHeaders(req.headers);
-	const fetchOptions = buildRelayRequest(
-		req,
-		filteredHeaders,
-		RELAY_TIMEOUT_MS,
-	) as RequestInit & { proxy?: string };
-
-	const targetUrlString = targetUrl.toString();
-
-	// -- Get IPv6 source for outbound binding ----------------------------------
-	const ipv6Source = ipv6Pool.getNext() ?? undefined;
-
-	// -- Execute upstream fetch with shared retry -------------------------------
-	const result = await fetchWithRetry(
-		targetUrlString,
-		fetchOptions,
-		proxyPool,
-		"relay",
-		ipv6Source,
-	);
-
-	if (result.errorClassification) {
-		logRelayEvent({
-			method,
-			url: requestUrl,
-			status: result.errorClassification.status,
-			durationMs: Math.round(performance.now() - startTime),
-			error: result.errorClassification.message,
-			targetUrl: targetUrlString,
-			ip: clientIP,
-		});
-		return createErrorResponse(result.errorClassification);
-	}
-
-	const relayedResponse = createRelayResponse(result.response!);
-
-	logRelayEvent({
-		method,
-		url: requestUrl,
-		status: relayedResponse.status,
-		durationMs: Math.round(performance.now() - startTime),
-		targetUrl: targetUrlString,
-		ip: clientIP,
-	});
-
-	return relayedResponse;
-}
-
-// --- WebSocket Relay Logic ---------------------------------------------------
-
-/**
- * Upgrade an HTTP request to a WebSocket and relay bidirectionally to the
- * target URL specified in the `x-relay-target` header.
- *
- * Returns `undefined` when the upgrade has been accepted (Bun takes over),
- * or a Response when the upgrade failed or the target is invalid.
- */
 function handleWebSocketUpgrade(
 	req: Request,
 	srv: Server<WSRelayData>,
@@ -369,8 +80,7 @@ function handleWebSocketUpgrade(
 	const target = req.headers.get("x-relay-target");
 	if (!target) return undefined;
 
-	const isWS =
-		target.startsWith("ws://") || target.startsWith("wss://");
+	const isWS = target.startsWith("ws://") || target.startsWith("wss://");
 	if (!isWS) return undefined;
 
 	const relayPath = req.headers.get("x-relay-path") ?? "/";
@@ -391,10 +101,8 @@ function handleWebSocketUpgrade(
 		});
 	}
 
-	const targetUrl = normalized.toString();
-
 	const upgraded = srv.upgrade(req, {
-		data: { target: targetUrl, relayPath },
+		data: { target: normalized.toString(), relayPath },
 	});
 
 	if (!upgraded) {
@@ -414,6 +122,7 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 
 	async fetch(req: Request): Promise<Response | undefined> {
 		const url = new URL(req.url);
+		const ipv6Source = ipv6Pool.getNext() ?? undefined;
 
 		// Static routes
 		if (url.pathname === "/health") return handleHealth();
@@ -425,85 +134,12 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 				headers: { "Content-Type": "text/html; charset=utf-8" },
 			});
 		}
-		if (url.pathname === "/" && req.method === "GET" && !req.headers.get("x-relay-target"))
+		if (
+			url.pathname === "/" &&
+			req.method === "GET" &&
+			!req.headers.get("x-relay-target")
+		)
 			return handleIndex();
-
-		// AI proxy routes -- OpenAI-compatible API
-		if (url.pathname === "/v1/chat/completions") {
-			if (req.method === "OPTIONS") {
-				return createCorsPreflightResponse();
-			}
-			if (req.method !== "POST") {
-				return new Response("Method Not Allowed", { status: 405 });
-			}
-			const authErr = requireAuth(req);
-			if (authErr) return authErr;
-			try {
-				const body = await req.json();
-				const sessionId = crypto.randomUUID();
-				const ipv6Source = ipv6Pool.getNext() ?? undefined;
-				console.log(`[index] POST /v1/chat/completions session=${sessionId.slice(0, 8)} model=${(body as any).model} poolSize=${proxyPool.size} sessionPool.active=${sessionPool.activeSessions} ipv6=${ipv6Source ?? "none"}`);
-				return handleChatCompletion(body, proxyPool, sessionPool, sessionId, ipv6Source);
-			} catch {
-				return new Response(
-					JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }),
-					{ status: 400, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
-				);
-			}
-		}
-
-		// AI proxy routes -- Anthropic-compatible API
-		if (url.pathname === "/v1/messages") {
-			if (req.method === "OPTIONS") {
-				return createCorsPreflightResponse();
-			}
-			if (req.method !== "POST") {
-				return new Response("Method Not Allowed", { status: 405 });
-			}
-			const authErr = requireAuth(req);
-			if (authErr) return authErr;
-			try {
-				const body = await req.json();
-				const sessionId = crypto.randomUUID();
-				const ipv6Source = ipv6Pool.getNext() ?? undefined;
-				const anthropicVersion = req.headers.get("anthropic-version") ?? undefined;
-				console.log(`[index] POST /v1/messages session=${sessionId.slice(0, 8)} model=${(body as any).model} poolSize=${proxyPool.size} sessionPool.active=${sessionPool.activeSessions} ipv6=${ipv6Source ?? "none"} anthropic-version=${anthropicVersion ?? "none"}`);
-				return handleAnthropicMessages(body, proxyPool, sessionPool, sessionId, ipv6Source, anthropicVersion);
-			} catch {
-				return new Response(
-					JSON.stringify({
-						type: "error",
-						error: { message: "Invalid JSON body", type: "invalid_request_error" },
-					}),
-					{ status: 400, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
-				);
-			}
-		}
-
-		if (url.pathname === "/v1/models" && req.method === "GET") {
-			const authErr = requireAuth(req);
-			if (authErr) return authErr;
-			const models = listModels().map((id) => ({
-				id,
-				object: "model",
-				created: Math.floor(Date.now() / 1000),
-				owned_by: "edge-proxy",
-				features: ["prompt_caching"],
-			}));
-			return new Response(
-				JSON.stringify({
-					object: "list",
-					data: models,
-				}),
-				{
-					status: 200,
-					headers: {
-						"Content-Type": "application/json",
-						...getCorsHeaders(),
-					},
-				},
-			);
-		}
 
 		// WebSocket upgrade check
 		if (
@@ -511,20 +147,33 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 			req.headers.get("upgrade")?.toLowerCase() === "websocket"
 		) {
 			const wsResult = handleWebSocketUpgrade(req, server);
-			if (wsResult === undefined) {
-				return undefined;
-			}
+			if (wsResult === undefined) return undefined;
 			return wsResult;
 		}
 
-		// Generic HTTP relay
-		return handleRelay(req, server);
+		// Delegate all other routing (including AI proxy routes) to the shared router
+		const clientIP = getClientIP(req, server);
+		const result = await (await import("./lib/router")).handleRequest(
+			req,
+			routerEnv,
+			clientIP,
+			{
+				isWebSocketSupported: true,
+				ipv6Source,
+			},
+		);
+		if (result !== undefined) return result;
+
+		return undefined;
 	},
 
 	websocket: {
 		open(ws: ServerWebSocket<WSRelayData>) {
 			const { target } = ws.data;
 
+			const {
+				logRelayEvent,
+			} = require("./middleware/logger");
 			logRelayEvent({
 				method: "WS",
 				url: target,
@@ -535,14 +184,10 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 
 			const upstream = new WebSocket(target);
 
-			upstream.onopen = () => {
-				// Connection established
-			};
+			upstream.onopen = () => {};
 
 			upstream.onmessage = (event: MessageEvent) => {
-				// Backpressure: drop messages when client buffer is full
 				if (ws.data.paused) return;
-
 				const data = event.data;
 				if (typeof data === "string") {
 					ws.sendText(data);
@@ -550,9 +195,7 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 					ws.sendBinary(new Uint8Array(data));
 				} else if (data instanceof Blob) {
 					data.arrayBuffer().then((buf) => {
-						if (!ws.data.paused) {
-							ws.sendBinary(new Uint8Array(buf));
-						}
+						if (!ws.data.paused) ws.sendBinary(new Uint8Array(buf));
 					});
 				} else {
 					ws.sendBinary(data as unknown as Uint8Array);
@@ -570,14 +213,13 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 			ws.data.upstream = upstream;
 		},
 
-		message(ws: ServerWebSocket<WSRelayData>, message: string | Buffer<ArrayBuffer>) {
+		message(
+			ws: ServerWebSocket<WSRelayData>,
+			message: string | Buffer<ArrayBuffer>,
+		) {
 			const upstream = ws.data.upstream;
 			if (upstream && upstream.readyState === WebSocket.OPEN) {
-				if (typeof message === "string") {
-					upstream.send(message);
-				} else {
-					upstream.send(message);
-				}
+				upstream.send(message);
 			}
 		},
 
@@ -593,22 +235,25 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 		},
 
 		drain(ws: ServerWebSocket<WSRelayData>) {
-			// Backpressure: pause forwarding when client buffer is large
 			const upstream = ws.data.upstream;
 			if (!upstream || upstream.readyState !== WebSocket.OPEN) return;
 
 			const buffered = (ws as any).bufferAmount ?? 0;
 			const BACKPRESSURE_THRESHOLD = 512 * 1024; // 512KB
-			const RESUME_THRESHOLD = 64 * 1024;        // 64KB
+			const RESUME_THRESHOLD = 64 * 1024; // 64KB
 
 			if (buffered > BACKPRESSURE_THRESHOLD) {
 				if (!ws.data.paused) {
 					ws.data.paused = true;
-					console.warn(`[ws] Client backpressure: pausing upstream forwarding (${buffered} bytes buffered)`);
+					console.warn(
+						`[ws] Client backpressure: pausing upstream forwarding (${buffered} bytes buffered)`,
+					);
 				}
 			} else if (ws.data.paused && buffered < RESUME_THRESHOLD) {
 				ws.data.paused = false;
-				console.log(`[ws] Client backpressure cleared: resuming upstream forwarding (${buffered} bytes buffered)`);
+				console.log(
+					`[ws] Client backpressure cleared: resuming upstream forwarding (${buffered} bytes buffered)`,
+				);
 			}
 		},
 	},
@@ -627,10 +272,7 @@ if (isDevMode()) {
 
 const shutdownHandler = async (signal: string) => {
 	console.log(`\n[relay] Received ${signal}, shutting down gracefully...`);
-
-	// Close active SSE streams so clients get proper stream end events
 	await closeAllActiveReaders();
-
 	server.stop();
 	process.exit(0);
 };
@@ -641,10 +283,4 @@ process.on("SIGINT", () => shutdownHandler("SIGINT"));
 // --- Exports (for testing) ---------------------------------------------------
 
 export type { WSRelayData };
-export {
-	server,
-	handleHealth,
-	handleIndex,
-	handleRelay,
-	getClientIP,
-};
+export { server, handleHealth, handleIndex, getClientIP };

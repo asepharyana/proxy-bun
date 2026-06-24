@@ -1,3 +1,20 @@
+/**
+ * Consolidated router — single source of truth for all route handlers.
+ *
+ * Exports every shared handler that the 3 entry points (standalone Bun,
+ * Vercel, Cloudflare Workers) need.
+ *
+ * Handles:
+ *   - Health check  (GET /health)
+ *   - Index page    (GET /)
+ *   - API docs      (GET /docs)
+ *   - Auth          (API_KEY check)
+ *   - AI proxy      (OpenAI /v1/chat/completions, Anthropic /v1/messages, /v1/models)
+ *   - Generic relay (x-relay-target)
+ *   - WebSocket     (upgrade check)
+ *   - SSRF DNS rebinding protection
+ */
+
 import {
 	normalizeTargetUrl,
 	isAllowedTarget,
@@ -6,6 +23,7 @@ import {
 	filterRequestHeaders,
 	buildRelayRequest,
 	createRelayResponse,
+	classifyFetchError,
 	createErrorResponse,
 	createCorsPreflightResponse,
 	getCorsHeaders,
@@ -30,15 +48,14 @@ export interface RouterEnv {
 	CORS_ORIGIN?: string;
 	NODE_ENV?: string;
 	API_KEY?: string;
-	PROXY_LIST?: string; // Comma-separated list of proxies for serverless
-	// Optional KV binding for rate limiter
+	PROXY_LIST?: string;
 	KV?: {
 		get(key: string): Promise<any>;
 		put(key: string, value: any, options?: { expirationTtl?: number }): Promise<void>;
 	};
 }
 
-// --- Global singletons (survives warm starts) --------------------------------
+// --- Globals (module-scoped singletons) --------------------------------------
 
 let rateLimiter: ReturnType<typeof createRateLimiter> | null = null;
 let proxyPool: ProxyPool | null = null;
@@ -49,29 +66,56 @@ const RELAY_VERSION = "1.0.0";
 
 // --- Helpers -----------------------------------------------------------------
 
-function getNumericEnv(env: RouterEnv, key: keyof RouterEnv, fallback: number): number {
+function getNumericEnv(
+	env: RouterEnv,
+	key: keyof RouterEnv,
+	fallback: number,
+): number {
 	const raw = env[key];
-	const val = typeof raw === "string" ? raw : (typeof process !== "undefined" ? process.env[key as string] : undefined);
+	const val =
+		typeof raw === "string"
+			? raw
+			: typeof process !== "undefined"
+				? process.env[key as string]
+				: undefined;
 	return Number.parseInt(val ?? String(fallback), 10);
 }
 
-function getEnv(env: RouterEnv, key: keyof RouterEnv, fallback: string): string {
+function getEnv(
+	env: RouterEnv,
+	key: keyof RouterEnv,
+	fallback: string,
+): string {
 	const raw = env[key];
-	const fromEnv = typeof raw === "string" ? raw : (typeof process !== "undefined" ? process.env[key as string] : undefined);
+	const fromEnv =
+		typeof raw === "string"
+			? raw
+			: typeof process !== "undefined"
+				? process.env[key as string]
+				: undefined;
 	return fromEnv ?? fallback;
 }
 
+/** Determine if an error is a JSON parse failure. */
+function isJsonParseError(err: unknown): boolean {
+	return err instanceof Error && (err.name === "SyntaxError" || err.message.includes("JSON"));
+}
+
+// --- Init --------------------------------------------------------------------
+
 function initGlobals(env: RouterEnv) {
 	if (!rateLimiter) {
-		const kvAdapter = env.KV ? {
-			get: async (k: string) => {
-				const val = await env.KV!.get(k);
-				return val ? JSON.parse(val) : null;
-			},
-			set: async (k: string, v: number[], ttl?: number) => {
-				await env.KV!.put(k, JSON.stringify(v), { expirationTtl: ttl });
-			}
-		} : undefined;
+		const kvAdapter = env.KV
+			? {
+					get: async (k: string) => {
+						const val = await env.KV!.get(k);
+						return val ? JSON.parse(val) : null;
+					},
+					set: async (k: string, v: number[], ttl?: number) => {
+						await env.KV!.put(k, JSON.stringify(v), { expirationTtl: ttl });
+					},
+				}
+			: undefined;
 
 		rateLimiter = createRateLimiter({
 			maxRequests: getNumericEnv(env, "RATE_LIMIT_MAX", 100),
@@ -82,7 +126,6 @@ function initGlobals(env: RouterEnv) {
 
 	if (!proxyPool) {
 		proxyPool = new ProxyPool();
-		// For Bun (process.env.PROXY_FILE) it's loaded in index.ts, but for serverless we can load from env
 		const proxies = getEnv(env, "PROXY_LIST", "");
 		if (proxies) {
 			for (const p of proxies.split(",")) {
@@ -95,11 +138,21 @@ function initGlobals(env: RouterEnv) {
 	}
 }
 
-function requireAuth(req: Request, env: RouterEnv): Response | null {
-	const API_KEY = getEnv(env, "API_KEY", "sk-dummy-key");
-	const header = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? "";
+// --- Auth --------------------------------------------------------------------
+
+function requireAuth(req: Request, env?: RouterEnv): Response | null {
+	const API_KEY = env
+		? getEnv(env, "API_KEY", "")
+		: (process.env.API_KEY ?? "");
+	if (!API_KEY) return null; // auth disabled
+
+	const header =
+		req.headers.get("authorization") ??
+		req.headers.get("x-api-key") ??
+		"";
 	const key = header.replace(/^Bearer\s+/i, "").trim();
 	if (key === API_KEY) return null;
+
 	return new Response(
 		JSON.stringify({ error: { message: "Unauthorized", type: "auth_error" } }),
 		{
@@ -107,6 +160,35 @@ function requireAuth(req: Request, env: RouterEnv): Response | null {
 			headers: { "Content-Type": "application/json", ...getCorsHeaders() },
 		},
 	);
+}
+
+// --- IP Detection ------------------------------------------------------------
+
+function getClientIP(req: Request): string {
+	const forwarded = req.headers.get("x-forwarded-for");
+	if (forwarded) {
+		const first = forwarded.split(",")[0]?.trim();
+		if (first) return first;
+	}
+	const cfIp = req.headers.get("cf-connecting-ip");
+	if (cfIp) return cfIp;
+	return "unknown";
+}
+
+function getClientIPFromServer(
+	req: Request,
+	ipGetter: { requestIP(req: Request): { address: string } | null },
+): string {
+	const forwarded = req.headers.get("x-forwarded-for");
+	if (forwarded) {
+		const first = forwarded.split(",")[0]?.trim();
+		if (first) return first;
+	}
+	const cfIp = req.headers.get("cf-connecting-ip");
+	if (cfIp) return cfIp;
+	const remote = ipGetter.requestIP(req);
+	if (remote) return remote.address;
+	return "unknown";
 }
 
 // --- Static Handlers ---------------------------------------------------------
@@ -120,45 +202,40 @@ function handleHealth(): Response {
 		}),
 		{
 			status: 200,
-			headers: {
-				"Content-Type": "application/json",
-				...getCorsHeaders(),
-			},
+			headers: { "Content-Type": "application/json", ...getCorsHeaders() },
 		},
 	);
 }
 
 function handleIndex(): Response {
 	const html = `<!DOCTYPE html>
-	<html lang="en">
-	<head>
-	  <meta charset="UTF-8">
-	  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-	  <title>Edge Proxy Relay</title>
-	  <style>
-	    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-	    body { font-family: system-ui, -apple-system, sans-serif; line-height: 1.6; color: #e1e4e8; background: #0d1117; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-	    main { text-align: center; }
-	    h1 { font-size: 2rem; color: #58a6ff; margin-bottom: 0.5rem; }
-	    p { color: #8b949e; }
-	    a { color: #58a6ff; }
-	    .status { color: #3fb950; }
-	  </style>
-	</head>
-	<body>
-	<main>
-	  <h1>Edge Proxy Relay</h1>
-	  <p class="status">Server is running</p>
-	  <p><a href="/health">/health</a> &middot; <a href="/docs">/docs</a></p>
-	</main>
-	</body>
-	</html>`;
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Edge Proxy Relay</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, sans-serif; line-height: 1.6; color: #e1e4e8; background: #0d1117; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    main { text-align: center; }
+    h1 { font-size: 2rem; color: #58a6ff; margin-bottom: 0.5rem; }
+    p { color: #8b949e; }
+    a { color: #58a6ff; }
+    .status { color: #3fb950; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Edge Proxy Relay</h1>
+  <p class="status">Server is running</p>
+  <p><a href="/health">/health</a> &middot; <a href="/docs">/docs</a></p>
+</main>
+</body>
+</html>`;
 
 	return new Response(html, {
 		status: 200,
-		headers: {
-			"Content-Type": "text/html; charset=utf-8",
-		},
+		headers: { "Content-Type": "text/html; charset=utf-8" },
 	});
 }
 
@@ -214,9 +291,9 @@ function handleDocs(_isWebSocketSupported: boolean): Response {
       <span class="arrow">▶</span>
     </div>
     <div class="card-body">
-      <label>API Key (default: <code>sk-dummy-key</code>)</label>
+      <label>API Key</label>
       <div class="row">
-        <input type="text" id="apiKey" value="sk-dummy-key" />
+        <input type="text" id="apiKey" value="" />
         <input type="text" id="baseUrl" value="" placeholder="(same origin)" />
       </div>
     </div>
@@ -307,7 +384,8 @@ function handleDocs(_isWebSocketSupported: boolean): Response {
 <script>
 function apiBase() { return document.getElementById('baseUrl').value || ''; }
 function authHeaders() {
-  const k = document.getElementById('apiKey').value || 'sk-dummy-key';
+  const k = document.getElementById('apiKey').value;
+  if (!k) return { 'Content-Type': 'application/json' };
   return { 'Authorization': 'Bearer ' + k, 'Content-Type': 'application/json' };
 }
 function toggleCard(h) { h.parentElement.classList.toggle('open'); }
@@ -341,21 +419,16 @@ function streamOutput(id, chunk) {
   pre.textContent += chunk;
   pre.scrollTop = pre.scrollHeight;
 }
-let _t;
-function elapsed() { return Date.now() - _t; }
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
-async function callHealth() { _t = Date.now(); try { var r = await apiFetch('GET','/health'); showOutput('health',r.resp,r.data); } catch(e) { showOutput('health',{status:0,statusText:'Error'},e.message); showToast(e.message,0); } }
-async function callModels() { _t = Date.now(); try { var r = await apiFetch('GET','/v1/models'); showOutput('models',r.resp,r.data); } catch(e) { showOutput('models',{status:0,statusText:'Error'},e.message); showToast(e.message,0); } }
-
+async function callHealth() { try { var r = await apiFetch('GET','/health'); showOutput('health',r.resp,r.data); } catch(e) { showOutput('health',{status:0,statusText:'Error'},e.message); showToast(e.message,0); } }
+async function callModels() { try { var r = await apiFetch('GET','/v1/models'); showOutput('models',r.resp,r.data); } catch(e) { showOutput('models',{status:0,statusText:'Error'},e.message); showToast(e.message,0); } }
 async function callChat() {
-  _t = Date.now();
   const stream = document.getElementById('chatStream').checked;
   try { var messages = JSON.parse(document.getElementById('chatMessages').value); } catch { showToast('Invalid messages JSON',0); return; }
   const body = { model: document.getElementById('chatModel').value || 'deepseek-v4-flash-free', messages, stream, max_tokens: parseInt(document.getElementById('chatMaxTokens').value) || 128 };
   try {
-    if (stream) {
-      var el = document.getElementById('output-chat'); el.style.display = 'block'; el.innerHTML = '<div class="meta">streaming…</div><pre></pre>';
+    if (stream) { var el = document.getElementById('output-chat'); el.style.display = 'block'; el.innerHTML = '<div class="meta">streaming…</div><pre></pre>';
       var resp = await fetch((apiBase()||'') + '/v1/chat/completions', { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) });
       if (!resp.ok) { showOutput('chat',resp,await resp.text()); return; }
       var reader = resp.body.getReader(), decoder = new TextDecoder(), done;
@@ -364,17 +437,14 @@ async function callChat() {
     } else { var r = await apiFetch('POST','/v1/chat/completions', body); showOutput('chat',r.resp,r.data); }
   } catch(e) { showOutput('chat',{status:0,statusText:'Error'},e.message); showToast(e.message,0); }
 }
-
 async function callAnthropic() {
-  _t = Date.now();
   const stream = document.getElementById('anthStream').checked;
   try { var messages = JSON.parse(document.getElementById('anthMessages').value); } catch { showToast('Invalid messages JSON',0); return; }
   const body = { model: document.getElementById('anthModel').value || 'deepseek-v4-flash-free', max_tokens: parseInt(document.getElementById('anthMaxTokens').value) || 256, messages, stream };
   const sys = document.getElementById('anthSystem').value.trim();
   if (sys) { try { body.system = JSON.parse(sys); } catch { body.system = sys; } }
   try {
-    if (stream) {
-      var el = document.getElementById('output-anth'); el.style.display = 'block'; el.innerHTML = '<div class="meta">streaming…</div><pre></pre>';
+    if (stream) { var el = document.getElementById('output-anth'); el.style.display = 'block'; el.innerHTML = '<div class="meta">streaming…</div><pre></pre>';
       var resp = await fetch((apiBase()||'') + '/v1/messages', { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) });
       if (!resp.ok) { showOutput('anth',resp,await resp.text()); return; }
       var reader = resp.body.getReader(), decoder = new TextDecoder(), done;
@@ -383,9 +453,7 @@ async function callAnthropic() {
     } else { var r = await apiFetch('POST','/v1/messages', body); showOutput('anth',r.resp,r.data); }
   } catch(e) { showOutput('anth',{status:0,statusText:'Error'},e.message); showToast(e.message,0); }
 }
-
 async function callRelay() {
-  _t = Date.now();
   const target = document.getElementById('relayTarget').value;
   const path = document.getElementById('relayPath').value || '/';
   const method = document.getElementById('relayMethod').value;
@@ -403,19 +471,94 @@ async function callRelay() {
 
 	return new Response(html, {
 		status: 200,
-		headers: {
-			"Content-Type": "text/html; charset=utf-8",
-			...getCorsHeaders(),
-		},
+		headers: { "Content-Type": "text/html; charset=utf-8", ...getCorsHeaders() },
 	});
 }
 
-// --- Generic HTTP Relay ------------------------------------------------------
+// --- Middleware pipeline helpers ---------------------------------------------
+
+/**
+ * Validate and normalize the relay target from headers.
+ * Returns the target URL on success, or an error Response.
+ */
+async function validateRelayTarget(
+	target: string | null,
+	relayPath: string,
+	method: string,
+	requestUrl: string,
+	clientIP: string,
+	startTime: number,
+): Promise<{ ok: true; targetUrl: string } | Response> {
+	const targetUrl = normalizeTargetUrl(target, relayPath);
+	if (!targetUrl) {
+		logRelayEvent({ method, url: requestUrl, status: 400, durationMs: Math.round(performance.now() - startTime), error: "missing_target_header", ip: clientIP });
+		return createErrorResponse({ code: "INVALID_TARGET", status: 400, message: "Missing or invalid x-relay-target header" });
+	}
+	if (!isAllowedTarget(targetUrl)) {
+		logRelayEvent({ method, url: requestUrl, status: 403, durationMs: Math.round(performance.now() - startTime), error: "target_not_allowed", ip: clientIP });
+		return createErrorResponse({ code: "SSRF_BLOCKED", status: 403, message: "Target domain not allowed" });
+	}
+
+	if (isSsrfDnsCheckEnabled()) {
+		const asyncAllowed = await isAllowedTargetAsync(targetUrl);
+		if (!asyncAllowed) {
+			logRelayEvent({ method, url: requestUrl, status: 403, durationMs: Math.round(performance.now() - startTime), error: "ssrf_dns_rebinding", ip: clientIP });
+			return createErrorResponse({ code: "SSRF_BLOCKED", status: 403, message: "Target resolves to private/internal IP" });
+		}
+	}
+
+	return { ok: true, targetUrl: targetUrl.toString() };
+}
+
+/** Log and return a relay result. */
+function finalizeRelay(
+	response: Response,
+	method: string,
+	requestUrl: string,
+	startTime: number,
+	targetUrlString: string,
+	clientIP: string,
+): Response {
+	logRelayEvent({ method, url: requestUrl, status: response.status, durationMs: Math.round(performance.now() - startTime), targetUrl: targetUrlString, ip: clientIP });
+	return response;
+}
+
+/** Build a JSON error Response for invalid request body. Returns both OpenAI and Anthropic formats. */
+function createJsonErrorResponse(err: unknown): Response {
+	const isJsonError = isJsonParseError(err);
+	if (isJsonError) {
+		return new Response(
+			JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }),
+			{ status: 400, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
+		);
+	}
+	return new Response(
+		JSON.stringify({ error: { message: err instanceof Error ? err.message : "Internal Server Error", type: "server_error" } }),
+		{ status: 500, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
+	);
+}
+
+function createAnthropicJsonErrorResponse(err: unknown): Response {
+	const isJsonError = isJsonParseError(err);
+	if (isJsonError) {
+		return new Response(
+			JSON.stringify({ type: "error", error: { message: "Invalid JSON body", type: "invalid_request_error" } }),
+			{ status: 400, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
+		);
+	}
+	return new Response(
+		JSON.stringify({ type: "error", error: { message: err instanceof Error ? err.message : "Internal Server Error", type: "server_error" } }),
+		{ status: 500, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
+	);
+}
+
+// --- Generic HTTP Relay (with proxy pool) ------------------------------------
 
 async function handleRelay(
 	req: Request,
 	env: RouterEnv,
 	clientIP: string,
+	extra?: { ipv6Source?: string; skipProxyPool?: boolean },
 ): Promise<Response> {
 	const startTime = performance.now();
 	const method = req.method;
@@ -423,156 +566,110 @@ async function handleRelay(
 
 	const RELAY_TIMEOUT_MS = getNumericEnv(env, "RELAY_TIMEOUT_MS", 30000);
 
-	// -- Pre-flight CORS
-	if (method === "OPTIONS") {
-		return createCorsPreflightResponse();
-	}
+	if (method === "OPTIONS") return createCorsPreflightResponse();
 
-	// -- Middleware: Body size check
+	// Body size check
 	const bodyError = checkBodySize(req);
 	if (bodyError) {
-		logRelayEvent({
-			method,
-			url: requestUrl,
-			status: bodyError.status,
-			durationMs: Math.round(performance.now() - startTime),
-			ip: clientIP,
-		});
-		return bodyError;
+		return finalizeRelay(bodyError, method, requestUrl, startTime, "", clientIP);
 	}
 
-	// -- Middleware: Rate limiting
+	// Rate limiting
 	const rateCheck = await rateLimiter!.checkAsync(clientIP);
 	if (!rateCheck.allowed) {
-		logRelayEvent({
-			method,
-			url: requestUrl,
-			status: 429,
-			durationMs: Math.round(performance.now() - startTime),
-			error: "rate_limit_exceeded",
-			ip: clientIP,
-		});
-		return new Response(
-			JSON.stringify({
-				error: true,
-				code: "RATE_LIMITED",
-				message: "Too many requests",
-				retryAfterMs: rateCheck.retryAfterMs,
-			}),
-			{
-				status: 429,
-				headers: {
-					"Content-Type": "application/json",
-					...getCorsHeaders(),
-					"Retry-After": String(
-						Math.ceil((rateCheck.retryAfterMs ?? 60_000) / 1000),
-					),
+		return finalizeRelay(
+			new Response(
+				JSON.stringify({ error: true, code: "RATE_LIMITED", message: "Too many requests", retryAfterMs: rateCheck.retryAfterMs }),
+				{
+					status: 429,
+					headers: { "Content-Type": "application/json", ...getCorsHeaders(), "Retry-After": String(Math.ceil((rateCheck.retryAfterMs ?? 60_000) / 1000)) },
 				},
-			},
+			),
+			method, requestUrl, startTime, "", clientIP,
 		);
 	}
 
-	// -- Extract relay parameters from headers
+	// Target validation
 	const target = req.headers.get("x-relay-target");
 	const relayPath = req.headers.get("x-relay-path") ?? "/";
+	const validated = await validateRelayTarget(target, relayPath, method, requestUrl, clientIP, startTime);
+	if (validated instanceof Response) return validated;
+	const targetUrlString = validated.targetUrl;
 
-	// -- SSRF: Normalize and validate target URL
-	const targetUrl = normalizeTargetUrl(target, relayPath);
-	if (!targetUrl) {
-		logRelayEvent({
-			method,
-			url: requestUrl,
-			status: 400,
-			durationMs: Math.round(performance.now() - startTime),
-			error: "missing_target_header",
-			ip: clientIP,
-		});
-		return createErrorResponse({
-			code: "INVALID_TARGET",
-			status: 400,
-			message: "Missing or invalid x-relay-target header",
-		});
-	}
-
-	if (!isAllowedTarget(targetUrl)) {
-		logRelayEvent({
-			method,
-			url: requestUrl,
-			status: 403,
-			durationMs: Math.round(performance.now() - startTime),
-			error: "target_not_allowed",
-			ip: clientIP,
-		});
-		return createErrorResponse({
-			code: "SSRF_BLOCKED",
-			status: 403,
-			message: "Target domain not allowed",
-		});
-	}
-
-	// -- SSRF: DNS rebinding protection (optional, via SSRF_DNS_CHECK=true) -----
-	if (isSsrfDnsCheckEnabled()) {
-		const asyncAllowed = await isAllowedTargetAsync(targetUrl);
-		if (!asyncAllowed) {
-			logRelayEvent({
-				method,
-				url: requestUrl,
-				status: 403,
-				durationMs: Math.round(performance.now() - startTime),
-				error: "ssrf_dns_rebinding",
-				ip: clientIP,
-			});
-			return createErrorResponse({
-				code: "SSRF_BLOCKED",
-				status: 403,
-				message: "Target resolves to private/internal IP",
-			});
-		}
-	}
-
-	// -- Build the upstream request
+	// Build and execute
 	const filteredHeaders = filterRequestHeaders(req.headers);
-	const fetchOptions = buildRelayRequest(
-		req,
-		filteredHeaders,
-		RELAY_TIMEOUT_MS,
-	) as RequestInit & { proxy?: string };
+	const fetchOptions = buildRelayRequest(req, filteredHeaders, RELAY_TIMEOUT_MS) as RequestInit & { proxy?: string };
 
-	const targetUrlString = targetUrl.toString();
-
-	// -- Execute upstream fetch with shared retry
 	const result = await fetchWithRetry(
-		targetUrlString,
-		fetchOptions,
-		proxyPool!,
-		"relay",
+		targetUrlString, fetchOptions,
+		extra?.skipProxyPool ? undefined : proxyPool!,
+		"relay", extra?.ipv6Source,
 	);
 
 	if (result.errorClassification) {
-		logRelayEvent({
-			method,
-			url: requestUrl,
-			status: result.errorClassification.status,
-			durationMs: Math.round(performance.now() - startTime),
-			error: result.errorClassification.message,
-			targetUrl: targetUrlString,
-			ip: clientIP,
-		});
-		return createErrorResponse(result.errorClassification);
+		return finalizeRelay(
+			createErrorResponse(result.errorClassification),
+			method, requestUrl, startTime, targetUrlString, clientIP,
+		);
 	}
 
-	const relayedResponse = createRelayResponse(result.response!);
+	return finalizeRelay(
+		createRelayResponse(result.response!),
+		method, requestUrl, startTime, targetUrlString, clientIP,
+	);
+}
 
-	logRelayEvent({
-		method,
-		url: requestUrl,
-		status: relayedResponse.status,
-		durationMs: Math.round(performance.now() - startTime),
-		targetUrl: targetUrlString,
-		ip: clientIP,
-	});
+// --- Generic HTTP Relay (plain fetch) ----------------------------------------
 
-	return relayedResponse;
+async function handleRelayPlain(
+	req: Request,
+	env: RouterEnv,
+	clientIP: string,
+): Promise<Response> {
+	const startTime = performance.now();
+	const method = req.method;
+	const requestUrl = req.url;
+	const RELAY_TIMEOUT_MS = getNumericEnv(env, "RELAY_TIMEOUT_MS", 30000);
+
+	if (method === "OPTIONS") return createCorsPreflightResponse();
+
+	const bodyError = checkBodySize(req);
+	if (bodyError) return finalizeRelay(bodyError, method, requestUrl, startTime, "", clientIP);
+
+	const rateCheck = await rateLimiter!.checkAsync(clientIP);
+	if (!rateCheck.allowed) {
+		return finalizeRelay(
+			new Response(
+				JSON.stringify({ error: true, code: "RATE_LIMITED", message: "Too many requests", retryAfterMs: rateCheck.retryAfterMs }),
+				{ status: 429, headers: { "Content-Type": "application/json", ...getCorsHeaders(), "Retry-After": String(Math.ceil((rateCheck.retryAfterMs ?? 60_000) / 1000)) } },
+			),
+			method, requestUrl, startTime, "", clientIP,
+		);
+	}
+
+	const target = req.headers.get("x-relay-target");
+	const relayPath = req.headers.get("x-relay-path") ?? "/";
+	const validated = await validateRelayTarget(target, relayPath, method, requestUrl, clientIP, startTime);
+	if (validated instanceof Response) return validated;
+	const targetUrlString = validated.targetUrl;
+
+	const filteredHeaders = filterRequestHeaders(req.headers);
+	const fetchOptions = buildRelayRequest(req, filteredHeaders, RELAY_TIMEOUT_MS);
+
+	let response: Response;
+	try {
+		response = await fetch(targetUrlString, fetchOptions);
+	} catch (err) {
+		return finalizeRelay(
+			createErrorResponse(classifyFetchError(err)),
+			method, requestUrl, startTime, targetUrlString, clientIP,
+		);
+	}
+
+	return finalizeRelay(
+		createRelayResponse(response),
+		method, requestUrl, startTime, targetUrlString, clientIP,
+	);
 }
 
 // --- Main Router -------------------------------------------------------------
@@ -580,9 +677,11 @@ async function handleRelay(
 export interface RouterOptions {
 	isWebSocketSupported?: boolean;
 	getTestApiHtml?: () => string | Promise<string>;
+	skipProxyPool?: boolean;
+	ipv6Source?: string;
 }
 
-export async function handleRequest(
+async function handleRequest(
 	req: Request,
 	env: RouterEnv,
 	clientIP: string,
@@ -596,16 +695,11 @@ export async function handleRequest(
 	if (url.pathname === "/docs") return handleDocs(options.isWebSocketSupported ?? false);
 	if (url.pathname === "/test" && options.getTestApiHtml) {
 		const html = await options.getTestApiHtml();
-		return new Response(html, {
-			status: 200,
-			headers: { "Content-Type": "text/html; charset=utf-8" },
-		});
+		return new Response(html, { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } });
 	}
-	if (url.pathname === "/" && req.method === "GET" && !req.headers.get("x-relay-target")) {
-		return handleIndex();
-	}
+	if (url.pathname === "/" && req.method === "GET" && !req.headers.get("x-relay-target")) return handleIndex();
 
-	// AI proxy routes -- OpenAI-compatible API
+	// AI proxy — OpenAI-compatible
 	if (url.pathname === "/v1/chat/completions") {
 		if (req.method === "OPTIONS") return createCorsPreflightResponse();
 		if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
@@ -613,24 +707,13 @@ export async function handleRequest(
 		if (authErr) return authErr;
 		try {
 			const body = await req.json();
-			const sessionId = crypto.randomUUID();
-			return await handleChatCompletion(body, proxyPool!, sessionPool!, sessionId);
+			return await handleChatCompletion(body, proxyPool ?? undefined, sessionPool ?? undefined, crypto.randomUUID(), options.ipv6Source);
 		} catch (err) {
-			const isJsonError = err instanceof Error && (err.name === "SyntaxError" || err.message.includes("JSON"));
-			if (isJsonError) {
-				return new Response(
-					JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }),
-					{ status: 400, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
-				);
-			}
-			return new Response(
-				JSON.stringify({ error: { message: err instanceof Error ? err.message : "Internal Server Error", type: "server_error" } }),
-				{ status: 500, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
-			);
+			return createJsonErrorResponse(err);
 		}
 	}
 
-	// AI proxy routes -- Anthropic-compatible API
+	// AI proxy — Anthropic-compatible
 	if (url.pathname === "/v1/messages") {
 		if (req.method === "OPTIONS") return createCorsPreflightResponse();
 		if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
@@ -638,86 +721,48 @@ export async function handleRequest(
 		if (authErr) return authErr;
 		try {
 			const body = await req.json();
-			const sessionId = crypto.randomUUID();
 			const anthropicVersion = req.headers.get("anthropic-version") ?? undefined;
-			return await handleAnthropicMessages(body, proxyPool!, sessionPool!, sessionId, undefined, anthropicVersion);
+			return await handleAnthropicMessages(body, proxyPool ?? undefined, sessionPool ?? undefined, crypto.randomUUID(), options.ipv6Source, anthropicVersion);
 		} catch (err) {
-			const isJsonError = err instanceof Error && (err.name === "SyntaxError" || err.message.includes("JSON"));
-			if (isJsonError) {
-				return new Response(
-					JSON.stringify({
-						type: "error",
-						error: { message: "Invalid JSON body", type: "invalid_request_error" },
-					}),
-					{ status: 400, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
-				);
-			}
-			return new Response(
-				JSON.stringify({
-					type: "error",
-					error: { message: err instanceof Error ? err.message : "Internal Server Error", type: "server_error" },
-				}),
-				{ status: 500, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
-			);
+			return createAnthropicJsonErrorResponse(err);
 		}
 	}
 
+	// Model list
 	if (url.pathname === "/v1/models" && req.method === "GET") {
 		const authErr = requireAuth(req, env);
 		if (authErr) return authErr;
 		const models = listModels().map((id) => ({
-			id,
-			object: "model",
-			created: Math.floor(Date.now() / 1000),
-			owned_by: "edge-proxy",
-			features: ["prompt_caching"],
+			id, object: "model", created: Math.floor(Date.now() / 1000),
+			owned_by: "edge-proxy", features: ["prompt_caching"],
 		}));
-		return new Response(
-			JSON.stringify({
-				object: "list",
-				data: models,
-			}),
-			{
-				status: 200,
-				headers: {
-					"Content-Type": "application/json",
-					...getCorsHeaders(),
-				},
-			},
-		);
+		return new Response(JSON.stringify({ object: "list", data: models }), {
+			status: 200,
+			headers: { "Content-Type": "application/json", ...getCorsHeaders() },
+		});
 	}
 
-	// WebSocket upgrade check (Bun specific - worker/vercel should handle their own rejection if needed)
-	if (
-		req.method === "GET" &&
-		req.headers.get("upgrade")?.toLowerCase() === "websocket"
-	) {
+	// WebSocket upgrade check
+	if (req.method === "GET" && req.headers.get("upgrade")?.toLowerCase() === "websocket") {
 		if (!options.isWebSocketSupported) {
 			return new Response(
-				JSON.stringify({
-					error: true,
-					code: "UNSUPPORTED",
-					message: "WebSocket relay is not supported on this deployment",
-				}),
-				{
-					status: 400,
-					headers: {
-						"Content-Type": "application/json",
-						...getCorsHeaders(),
-					},
-				},
+				JSON.stringify({ error: true, code: "UNSUPPORTED", message: "WebSocket relay is not supported on this deployment" }),
+				{ status: 400, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
 			);
 		}
-		// Return undefined to let Bun handle the upgrade in its fetch method
 		return undefined;
 	}
 
 	// Generic HTTP relay
-	return handleRelay(req, env, clientIP);
+	return handleRelay(req, env, clientIP, {
+		ipv6Source: options.ipv6Source,
+		skipProxyPool: options.skipProxyPool,
+	});
 }
 
-// Ensure proxyPool is available for index.ts to use proxyPool.tryLoad()
-export function getSharedProxyPool() {
+// --- Proxy pool accessor -----------------------------------------------------
+
+function getSharedProxyPool(): ProxyPool {
 	if (!proxyPool) {
 		proxyPool = new ProxyPool();
 		sessionPool = new SessionProxyPool(proxyPool);
@@ -725,3 +770,17 @@ export function getSharedProxyPool() {
 	}
 	return proxyPool;
 }
+
+// --- Exports -----------------------------------------------------------------
+
+export {
+	handleHealth,
+	handleIndex,
+	handleRelay,
+	handleRelayPlain,
+	handleRequest,
+	requireAuth,
+	getClientIP,
+	getClientIPFromServer,
+	getSharedProxyPool,
+};
