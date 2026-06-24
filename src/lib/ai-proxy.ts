@@ -22,10 +22,11 @@ import * as aichatAuth from "./aichat-auth";
 
 export interface OpenAIRequest {
 	model: string;
-	messages: Array<{ role: string; content: string }>;
+	messages: Array<{ role: string; content: string | Array<Record<string, unknown>> }>;
 	temperature?: number;
 	max_tokens?: number;
 	top_p?: number;
+t	top_k?: number;
 	stream?: boolean;
 	stop?: string | string[];
 	presence_penalty?: number;
@@ -192,7 +193,7 @@ export const MODEL_ROUTES: Record<string, BackendConfig> = {
 			const hasMarker = messages.some(
 				(m) =>
 					m.role === "system" &&
-					m.content.includes("You are MiMoCode"),
+					(typeof m.content === "string" ? m.content.includes("You are MiMoCode") : false),
 			);
 			if (!hasMarker) {
 				messages.unshift({

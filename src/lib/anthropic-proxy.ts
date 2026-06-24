@@ -40,6 +40,8 @@ export interface AnthropicRequest {
 	stream?: boolean;
 	temperature?: number;
 	top_p?: number;
+t	top_k?: number;
+		stream?: boolean;
 	top_k?: number;
 	stop_sequences?: string[];
 	system?: string | AnthropicSystemBlock[];
@@ -86,6 +88,8 @@ interface BackendBody {
 	max_tokens: number;
 	temperature?: number;
 	top_p?: number;
+t	top_k?: number;
+		stream?: boolean;
 	top_k?: number;
 	stream?: boolean;
 	stop?: string | string[];
@@ -187,6 +191,10 @@ export function anthropicToBackend(
 	}
 
 	if (config.adaptRequest) {
+		const headers: Record<string, string> = {};
+		if (anthropicVersion) {
+			headers["anthropic-version"] = anthropicVersion;
+		}
 		return {
 			body: config.adaptRequest({
 				model: backendModel,
@@ -194,8 +202,13 @@ export function anthropicToBackend(
 				temperature: anthReq.temperature,
 				max_tokens: anthReq.max_tokens,
 				top_p: anthReq.top_p,
+				top_k: anthReq.top_k,
 				stream: anthReq.stream,
+				stop: anthReq.stop_sequences?.length === 1
+					? anthReq.stop_sequences[0]
+					: anthReq.stop_sequences,
 			}),
+			headers,
 		};
 	}
 
@@ -798,11 +811,37 @@ export async function handleAnthropicMessages(
 	// -- Handle error responses from backend ------------------------------------
 	if (!response.ok) {
 		const status = response.status;
-		const genericMsg = status >= 500 ? "Upstream server error" : "Upstream rejected request";
+		// Read the upstream error body so clients see the actual rejection reason,
+		// not just a generic "Upstream rejected request" message.
+		let upstreamMsg = status >= 500 ? "Upstream server error" : "Upstream rejected request";
+		try {
+			const errBody = await response.text();
+			if (errBody) {
+				const errJson = JSON.parse(errBody);
+				// OpenAI-style: { error: { message, type } }
+				if (errJson?.error?.message) {
+					upstreamMsg = errJson.error.message;
+				}
+				// Anthropic-style: { type: "error", error: { message, type } }
+				else if (errJson?.type === "error" && errJson?.error?.message) {
+					upstreamMsg = errJson.error.message;
+				}
+				// Plain JSON with message field
+				else if (errJson?.message) {
+					upstreamMsg = errJson.message;
+				}
+				// Raw text error body
+				else if (typeof errBody === "string" && errBody.length < 500) {
+					upstreamMsg = errBody;
+				}
+			}
+		} catch {
+			// Could not read error body — keep generic message
+		}
 		if (sessionPool && sessionId) {
 			sessionPool.release(sessionId);
 		}
-		return anthropicError(status, genericMsg, "upstream_error");
+		return anthropicError(status, upstreamMsg, "upstream_error");
 	}
 
 	// -- For native Anthropic passthrough, relay the raw backend response -------
