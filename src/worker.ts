@@ -23,6 +23,7 @@ import {
 	getCorsHeaders,
 } from "./lib/relay-utils";
 
+import { getTestPageHtml } from "./lib/test-page";
 import { checkBodySize } from "./middleware/body-limiter";
 import { createRateLimiter } from "./middleware/rate-limiter";
 import { logRelayEvent } from "./middleware/logger";
@@ -307,20 +308,10 @@ export default {
 
 		if (url.pathname === "/health") return handleHealth();
 		if (url.pathname === "/docs" || url.pathname === "/test") {
-			try {
-				const file = Bun.file("public/test-api.html");
-				const exists = await file.exists();
-				return new Response(exists ? file : "Not found", {
-					status: exists ? 200 : 404,
-					headers: { "Content-Type": "text/html; charset=utf-8" },
-				});
-			} catch {
-				// Bun.file not available in non-Bun runtimes (e.g. Workers)
-				return new Response("Not found", {
-					status: 404,
-					headers: { "Content-Type": "text/html; charset=utf-8" },
-				});
-			}
+			return new Response(getTestPageHtml(), {
+				status: 200,
+				headers: { "Content-Type": "text/html; charset=utf-8" },
+			});
 		}
 		if (
 			url.pathname === "/" &&

@@ -29,7 +29,7 @@ import { createRateLimiter } from "../src/middleware/rate-limiter";
 import { logRelayEvent } from "../src/middleware/logger";
 import { handleChatCompletion, listModels } from "../src/lib/ai-proxy";
 import { handleAnthropicMessages } from "../src/lib/anthropic-proxy";
-import testApiHtmlRaw from "./test-api-content";
+import { getTestPageHtml } from "../src/lib/test-page";
 
 // ─── Configuration ──────────────────────────────────────────────────────────────
 
@@ -42,7 +42,7 @@ const RELAY_VERSION = "1.0.0";
 
 // ─── API Key Authentication ─────────────────────────────────────────────────────
 
-const API_KEY = "sk-dummy-key";
+const API_KEY = process.env.API_KEY ?? "sk-dummy-key";
 
 function requireAuth(req: Request): Response | null {
 	const header = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? "";
@@ -382,7 +382,7 @@ export default {
 		// Static routes — show index only when no relay target is requested
 		if (url.pathname === "/health") return handleHealth();
 		if (url.pathname === "/docs" || url.pathname === "/test") {
-			return new Response(testApiHtmlRaw, {
+			return new Response(getTestPageHtml(), {
 				headers: { "Content-Type": "text/html; charset=utf-8" },
 			});
 		}
