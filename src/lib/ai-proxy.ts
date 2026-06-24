@@ -99,6 +99,48 @@ export const MODEL_ROUTES: Record<string, BackendConfig> = {
 		headers: {
 			"Content-Type": "application/json",
 		},
+		adaptResponse: (raw: any) => {
+			// opencode.ai wraps the real response as a JSON string inside choices[0].message.content.
+			// Detect this double-nesting and unwrap it so downstream Anthropic/OpenAI adapters
+			// see the real content and usage instead of a raw stringified blob.
+			const outerChoice = raw.choices?.[0];
+			const innerContent = outerChoice?.message?.content;
+			if (typeof innerContent === "string" && innerContent.startsWith("{")) {
+				try {
+					const inner = JSON.parse(innerContent);
+					const innerChoice = inner.choices?.[0];
+					if (innerChoice) {
+						// Merge: use the inner response as the source of truth for content and usage
+						const innerUsage = inner.usage ?? {};
+						return {
+							...raw,
+							choices: [
+								{
+									...outerChoice,
+									message: {
+										role: innerChoice.message?.role ?? "assistant",
+										// Prefer reasoning_content (thinking) when present; fall back to content
+										content: innerChoice.message?.reasoning_content
+											? `<thinking>${innerChoice.message.reasoning_content}</thinking>${innerChoice.message.content ?? ""}`
+											: (innerChoice.message?.content ?? innerContent),
+									},
+									finish_reason: innerChoice.finish_reason ?? outerChoice.finish_reason,
+								},
+							],
+							// Prefer inner usage (has real token counts) over outer (often zeros)
+							usage: {
+								prompt_tokens: innerUsage.prompt_tokens ?? innerUsage.input_tokens ?? raw.usage?.prompt_tokens ?? 0,
+								completion_tokens: innerUsage.completion_tokens ?? innerUsage.output_tokens ?? raw.usage?.completion_tokens ?? 0,
+								total_tokens: innerUsage.total_tokens ?? raw.usage?.total_tokens ?? 0,
+							},
+						};
+					}
+				} catch {
+					// Not valid JSON — treat innerContent as plain text
+				}
+			}
+			return raw;
+		},
 	},
 
 	// -- surfsense.com (custom format) -------------------------------------------
