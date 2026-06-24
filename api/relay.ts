@@ -247,7 +247,7 @@ async function handleRelay(req: Request): Promise<Response> {
 	// ── Execute upstream fetch ──────────────────────────────────────
 	let response: Response;
 	try {
-			response = await fetch(targetUrlString, fetchOptions);
+		response = await fetch(targetUrlString, fetchOptions);
 	} catch (err) {
 		const classified = classifyFetchError(err);
 		logRelayEvent({
@@ -280,126 +280,125 @@ async function handleRelay(req: Request): Promise<Response> {
 // ─── Exported Vercel Function Handler ───────────────────────────────────────────
 
 /**
- * Vercel Bun runtime handler.
+ * Hybrid handler for Vercel/Node web-api and Bun/Workers runtimes.
  *
- * Vercel's Bun runtime expects a `default` export that is an object with
- * a `fetch` method — NOT a bare default function.  This matches the
- * standard `Bun.serve()` handler shape.
- *
- * Handles routing, middleware, and relay logic — same semantics as the
- * standalone Bun.serve() server, minus WebSocket support.
+ * Exports both:
+ *   1. Default function: parsed by Vercel Node runtime.
+ *   2. Default.fetch(): parsed by Cloudflare / Bun runtimes.
  */
-export default {
-	async fetch(req: Request): Promise<Response> {
-		const url = new URL(req.url);
+async function fetchHandler(req: Request): Promise<Response> {
+	const url = new URL(req.url);
 
-		// Static routes — show index only when no relay target is requested
-		if (url.pathname === "/health") return handleHealth();
-		if (url.pathname === "/docs" || url.pathname === "/test") {
-			return new Response(getTestPageHtml(), {
-				headers: { "Content-Type": "text/html; charset=utf-8" },
-			});
-		}
-		if (
-			url.pathname === "/" &&
-			req.method === "GET" &&
-			!req.headers.get("x-relay-target")
-		) {
-			return handleIndex();
-		}
+	// Static routes — show index only when no relay target is requested
+	if (url.pathname === "/health") return handleHealth();
+	if (url.pathname === "/docs" || url.pathname === "/test") {
+		return new Response(getTestPageHtml(), {
+			headers: { "Content-Type": "text/html; charset=utf-8" },
+		});
+	}
+	if (
+		url.pathname === "/" &&
+		req.method === "GET" &&
+		!req.headers.get("x-relay-target")
+	) {
+		return handleIndex();
+	}
 
-		// WebSocket upgrade — not supported in Vercel Functions
-		if (
-			req.method === "GET" &&
-			req.headers.get("upgrade")?.toLowerCase() === "websocket"
-		) {
-			return new Response(
-				JSON.stringify({
-					error: true,
-					code: "UNSUPPORTED",
-					message: "WebSocket relay is not supported on this deployment",
-				}),
-				{
-					status: 400,
-					headers: {
-						"Content-Type": "application/json",
-						"Access-Control-Allow-Origin": "*",
-					},
+	// WebSocket upgrade — not supported in Vercel Functions
+	if (
+		req.method === "GET" &&
+		req.headers.get("upgrade")?.toLowerCase() === "websocket"
+	) {
+		return new Response(
+			JSON.stringify({
+				error: true,
+				code: "UNSUPPORTED",
+				message: "WebSocket relay is not supported on this deployment",
+			}),
+			{
+				status: 400,
+				headers: {
+					"Content-Type": "application/json",
+					"Access-Control-Allow-Origin": "*",
 				},
-			);
-		}
+			},
+		);
+	}
 
-		// AI proxy routes — OpenAI-compatible
-		if (url.pathname === "/v1/chat/completions") {
-			if (req.method === "OPTIONS") return createCorsPreflightResponse();
-			if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
-			const authErr = requireAuth(req);
-			if (authErr) return authErr;
-			try {
-				const body = await req.json();
-				return await handleChatCompletion(body);
-			} catch (err) {
-				const isJsonError = err instanceof Error && (err.name === "SyntaxError" || err.message.includes("JSON"));
-				if (isJsonError) {
-					return new Response(
-						JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }),
-						{ status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
-					);
-				}
+	// AI proxy routes — OpenAI-compatible
+	if (url.pathname === "/v1/chat/completions") {
+		if (req.method === "OPTIONS") return createCorsPreflightResponse();
+		if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+		const authErr = requireAuth(req);
+		if (authErr) return authErr;
+		try {
+			const body = await req.json();
+			return await handleChatCompletion(body);
+		} catch (err) {
+			const isJsonError = err instanceof Error && (err.name === "SyntaxError" || err.message.includes("JSON"));
+			if (isJsonError) {
 				return new Response(
-					JSON.stringify({ error: { message: err instanceof Error ? err.message : "Internal Server Error", type: "server_error" } }),
-					{ status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+					JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }),
+					{ status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
 				);
 			}
+			return new Response(
+				JSON.stringify({ error: { message: err instanceof Error ? err.message : "Internal Server Error", type: "server_error" } }),
+				{ status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+			);
 		}
+	}
 
-		// AI proxy routes — Anthropic-compatible
-		if (url.pathname === "/v1/messages") {
-			if (req.method === "OPTIONS") return createCorsPreflightResponse();
-			if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
-			const authErr = requireAuth(req);
-			if (authErr) return authErr;
-			try {
-				const body = await req.json();
-				return await handleAnthropicMessages(body);
-			} catch (err) {
-				const isJsonError = err instanceof Error && (err.name === "SyntaxError" || err.message.includes("JSON"));
-				if (isJsonError) {
-					return new Response(
-						JSON.stringify({
-							type: "error",
-							error: { message: "Invalid JSON body", type: "invalid_request_error" },
-						}),
-						{ status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
-					);
-				}
+	// AI proxy routes — Anthropic-compatible
+	if (url.pathname === "/v1/messages") {
+		if (req.method === "OPTIONS") return createCorsPreflightResponse();
+		if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+		const authErr = requireAuth(req);
+		if (authErr) return authErr;
+		try {
+			const body = await req.json();
+			return await handleAnthropicMessages(body);
+		} catch (err) {
+			const isJsonError = err instanceof Error && (err.name === "SyntaxError" || err.message.includes("JSON"));
+			if (isJsonError) {
 				return new Response(
 					JSON.stringify({
 						type: "error",
-						error: { message: err instanceof Error ? err.message : "Internal Server Error", type: "server_error" },
+						error: { message: "Invalid JSON body", type: "invalid_request_error" },
 					}),
-					{ status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+					{ status: 400, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
 				);
 			}
-		}
-
-		// Models list
-		if (url.pathname === "/v1/models" && req.method === "GET") {
-			const authErr = requireAuth(req);
-			if (authErr) return authErr;
-			const models = listModels().map((id) => ({
-				id,
-				object: "model",
-				created: Math.floor(Date.now() / 1000),
-				owned_by: "proxy",
-			}));
 			return new Response(
-				JSON.stringify({ object: "list", data: models }),
-				{ status: 200, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+				JSON.stringify({
+					type: "error",
+					error: { message: err instanceof Error ? err.message : "Internal Server Error", type: "server_error" },
+				}),
+				{ status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
 			);
 		}
+	}
 
-		// Generic HTTP relay
-		return handleRelay(req);
-	},
-};
+	// Models list
+	if (url.pathname === "/v1/models" && req.method === "GET") {
+		const authErr = requireAuth(req);
+		if (authErr) return authErr;
+		const models = listModels().map((id) => ({
+			id,
+			object: "model",
+			created: Math.floor(Date.now() / 1000),
+			owned_by: "proxy",
+		}));
+		return new Response(
+			JSON.stringify({ object: "list", data: models }),
+			{ status: 200, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } },
+		);
+	}
+
+	// Generic HTTP relay
+	return handleRelay(req);
+}
+
+export default Object.assign(fetchHandler, {
+	fetch: fetchHandler,
+});
