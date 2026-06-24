@@ -34,11 +34,26 @@ const EXPIRY_BUFFER_MS = 300_000; // 5 minutes
  * Uses Web Crypto API (available in Bun, Workers, and Node.js 20+).
  */
 async function generateDeviceFingerprint(): Promise<string> {
-  const hostname = os.hostname();
-  const platform = process.platform;
-  const arch = process.arch;
-  const cpus = os.cpus();
-  const cpuModel = cpus.length > 0 ? (cpus[0]?.model ?? "unknown") : "unknown";
+  let hostname = "unknown";
+  try {
+    hostname = os.hostname() ?? "unknown";
+  } catch {
+    // OS module hostname not available in this sandbox
+  }
+
+  const platform = process.platform ?? "unknown";
+  const arch = process.arch ?? "unknown";
+
+  let cpuModel = "unknown";
+  try {
+    const cpus = os.cpus();
+    if (cpus && cpus.length > 0) {
+      cpuModel = cpus[0]?.model ?? "unknown";
+    }
+  } catch {
+    // OS module cpus not available in this sandbox
+  }
+
   const username = process.env.USER ?? process.env.USERNAME ?? "unknown";
 
   const raw = `${hostname}|${platform}|${arch}|${cpuModel}|${username}`;
