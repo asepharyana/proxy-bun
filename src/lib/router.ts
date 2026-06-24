@@ -9,7 +9,6 @@ import {
 	createErrorResponse,
 	createCorsPreflightResponse,
 	getCorsHeaders,
-	classifyFetchError,
 } from "./relay-utils";
 
 import { checkBodySize } from "../middleware/body-limiter";
@@ -615,11 +614,18 @@ export async function handleRequest(
 		try {
 			const body = await req.json();
 			const sessionId = crypto.randomUUID();
-			return handleChatCompletion(body, proxyPool!, sessionPool!, sessionId);
-		} catch {
+			return await handleChatCompletion(body, proxyPool!, sessionPool!, sessionId);
+		} catch (err) {
+			const isJsonError = err instanceof Error && (err.name === "SyntaxError" || err.message.includes("JSON"));
+			if (isJsonError) {
+				return new Response(
+					JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }),
+					{ status: 400, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
+				);
+			}
 			return new Response(
-				JSON.stringify({ error: { message: "Invalid JSON body", type: "invalid_request_error" } }),
-				{ status: 400, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
+				JSON.stringify({ error: { message: err instanceof Error ? err.message : "Internal Server Error", type: "server_error" } }),
+				{ status: 500, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
 			);
 		}
 	}
@@ -634,14 +640,24 @@ export async function handleRequest(
 			const body = await req.json();
 			const sessionId = crypto.randomUUID();
 			const anthropicVersion = req.headers.get("anthropic-version") ?? undefined;
-			return handleAnthropicMessages(body, proxyPool!, sessionPool!, sessionId, undefined, anthropicVersion);
-		} catch {
+			return await handleAnthropicMessages(body, proxyPool!, sessionPool!, sessionId, undefined, anthropicVersion);
+		} catch (err) {
+			const isJsonError = err instanceof Error && (err.name === "SyntaxError" || err.message.includes("JSON"));
+			if (isJsonError) {
+				return new Response(
+					JSON.stringify({
+						type: "error",
+						error: { message: "Invalid JSON body", type: "invalid_request_error" },
+					}),
+					{ status: 400, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
+				);
+			}
 			return new Response(
 				JSON.stringify({
 					type: "error",
-					error: { message: "Invalid JSON body", type: "invalid_request_error" },
+					error: { message: err instanceof Error ? err.message : "Internal Server Error", type: "server_error" },
 				}),
-				{ status: 400, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
+				{ status: 500, headers: { "Content-Type": "application/json", ...getCorsHeaders() } },
 			);
 		}
 	}
