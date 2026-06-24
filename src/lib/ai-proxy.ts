@@ -26,7 +26,7 @@ export interface OpenAIRequest {
 	temperature?: number;
 	max_tokens?: number;
 	top_p?: number;
-t	top_k?: number;
+	top_k?: number;
 	stream?: boolean;
 	stop?: string | string[];
 	presence_penalty?: number;

@@ -40,9 +40,8 @@ export interface AnthropicRequest {
 	stream?: boolean;
 	temperature?: number;
 	top_p?: number;
-t	top_k?: number;
-		stream?: boolean;
 	top_k?: number;
+	stream?: boolean;
 	stop_sequences?: string[];
 	system?: string | AnthropicSystemBlock[];
 	metadata?: Record<string, unknown>;
@@ -88,8 +87,6 @@ interface BackendBody {
 	max_tokens: number;
 	temperature?: number;
 	top_p?: number;
-t	top_k?: number;
-		stream?: boolean;
 	top_k?: number;
 	stream?: boolean;
 	stop?: string | string[];
