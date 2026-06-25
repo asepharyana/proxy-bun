@@ -6,8 +6,7 @@
  *
  * Supported backends:
  *   - opencode.ai (OpenAI-compatible — passthrough)
- *   - surfsense.com (custom format — adapted)
- *   - deep-seek.ai (custom format — adapted)
+ *   - mimocode free (OpenAI-compatible)
  *
  * Streaming (SSE) is supported for all backends.
  */
@@ -15,7 +14,6 @@
 import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
 import { fetchWithRetry, fetchWithSessionRetry, SSELineBuffer, isDevMode, trackReader, releaseReader, wrapStreamWithCleanup, type FetchWithRetryResult } from "./fetch-utils";
 import { getJwt, invalidateJwt } from "./mimo-auth";
-import * as aichatAuth from "./aichat-auth";
 
 
 // --- Types -------------------------------------------------------------------
@@ -55,38 +53,6 @@ export interface BackendConfig {
 	 *  Only used when anthropicPassthrough is true. Can add/modify headers, body fields, etc. */
 	anthropicPassthroughRequest?: (body: unknown, model: string) => { body: unknown; headers?: Record<string, string> };
 }
-
-// --- Shared aichat.org backend config (all models use the same backend) ------
-
-/** Shared backend config for all aichat.org model routes. */
-const aichatConfig: BackendConfig = {
-	provider: "aichat",
-	url: "https://aichat.org/api/chat",
-	headers: {
-		"Content-Type": "application/json",
-		Accept: "text/event-stream",
-		Referer: "https://aichat.org/chat",
-		"User-Agent":
-			"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-	},
-	adaptRequest: (req: OpenAIRequest) => ({
-		model: req.model,
-		messages: req.messages,
-	}),
-};
-
-/** All aichat.org model IDs discovered from the chat UI. */
-export const AICHAT_MODELS: readonly string[] = [
-	"deepseek/deepseek-v4-flash",
-	"openai/gpt-4o-mini",
-	"anthropic/claude-haiku-4-5",
-	"google/gemini-2.0-flash-001",
-	"x-ai/grok-3-mini-beta",
-	"deepseek/deepseek-chat-v3-0324",
-	"qwen/qwen-2.5-72b-instruct",
-	"moonshotai/moonlight-16k",
-	"perplexity/sonar",
-];
 
 // --- Model routing table -------------------------------------------------------
 
@@ -142,82 +108,6 @@ export const MODEL_ROUTES: Record<string, BackendConfig> = {
 			return raw;
 		},
 	},
-
-	// -- surfsense.com (custom format) -------------------------------------------
-	"gpt-5.4-mini-no-login": {
-		provider: "surfsense",
-		url: "https://api.surfsense.com/api/v1/public/anon-chat/stream",
-		modelField: "model_slug",
-		headers: {
-			accept: "*/*",
-			"accept-language": "en-US,en;q=0.7",
-			"content-type": "application/json",
-			origin: "https://www.surfsense.com",
-			referer: "https://www.surfsense.com/",
-			"user-agent":
-				"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-		},
-		adaptRequest: (req) => ({
-			model_slug: req.model,
-			messages: req.messages,
-		}),
-		adaptStreamLine: (line) => {
-			if (!line.startsWith("data: ")) return null;
-			try {
-				const raw = JSON.parse(line.slice(6));
-				if (raw.type === "finish" || raw.done) return "data: [DONE]";
-				if (raw.type !== "text-delta") return null;
-				const text = raw.delta ?? raw.content ?? "";
-				if (!text) return null;
-				return `data: ${JSON.stringify({
-					id: `chatcmpl-${Date.now()}`,
-					object: "chat.completion.chunk",
-					created: Math.floor(Date.now() / 1000),
-					model: "gpt-5.4-mini-no-login",
-					choices: [
-						{
-							index: 0,
-							delta: { content: text },
-							finish_reason: null,
-						},
-					],
-				})}`;
-			} catch {
-				return null;
-			}
-		},
-		adaptResponse: (raw: any) => ({
-			id: `chatcmpl-${Date.now()}`,
-			object: "chat.completion",
-			created: Math.floor(Date.now() / 1000),
-			model: "gpt-5.4-mini-no-login",
-			choices: [
-				{
-					index: 0,
-					message: {
-						role: "assistant",
-						content: raw.content ?? raw.text ?? "",
-					},
-					finish_reason: "stop",
-				},
-			],
-			usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-		}),
-	},
-
-	// -- aichat.org (OpenAI-compatible, relay via session auth) ------------------
-	// All models share the same backend config. aichat.org's /api/chat
-	// proxies to OpenRouter internally and accepts any OpenRouter model ID.
-
-	"deepseek/deepseek-v4-flash": aichatConfig,
-	"openai/gpt-4o-mini": aichatConfig,
-	"anthropic/claude-haiku-4-5": aichatConfig,
-	"google/gemini-2.0-flash-001": aichatConfig,
-	"x-ai/grok-3-mini-beta": aichatConfig,
-	"deepseek/deepseek-chat-v3-0324": aichatConfig,
-	"qwen/qwen-2.5-72b-instruct": aichatConfig,
-	"moonshotai/moonlight-16k": aichatConfig,
-	"perplexity/sonar": aichatConfig,
 
 	// -- Xiaomi MiMo Free (OpenAI-compatible, JWT bootstrap auth) -----------------
 	"mimo-auto": {
@@ -465,16 +355,6 @@ export async function handleChatCompletion(
 		};
 	}
 
-	// -- aichat.org: inject session cookies + CSRF header ----------------------
-	if (config.provider === "aichat") {
-		const aichat = await aichatAuth.getAichatSession();
-		init.headers = {
-			...init.headers,
-			Cookie: aichat.cookies,
-			"X-CSRF-TOKEN": aichat.csrfToken,
-		};
-	}
-
 	// -- Execute with session-aware or standard retry --------------------------
 	let result: FetchWithRetryResult =
 		sessionPool && sessionId
@@ -492,25 +372,6 @@ export async function handleChatCompletion(
 		init.headers = {
 			...init.headers,
 			Authorization: `Bearer ${jwt}`,
-		};
-		result =
-			sessionPool && sessionId
-				? await fetchWithSessionRetry(url, init, sessionPool, sessionId, `openai:${req.model}`, undefined, ipv6Source)
-				: await fetchWithRetry(url, init, proxyPool, `openai:${req.model}`, ipv6Source);
-	}
-
-	// -- aichat.org: session expiry → invalidate session and retry once ---------
-	if (
-		config.provider === "aichat" &&
-		result.response &&
-		result.response.status === 401
-	) {
-		aichatAuth.invalidateAichatSession();
-		const aichat = await aichatAuth.getAichatSession();
-		init.headers = {
-			...init.headers,
-			Cookie: aichat.cookies,
-			"X-CSRF-TOKEN": aichat.csrfToken,
 		};
 		result =
 			sessionPool && sessionId
@@ -538,11 +399,6 @@ export async function handleChatCompletion(
 
 	const response = result.response!;
 
-	// -- aichat.org: refresh session cookies from every response -----------------
-	if (config.provider === "aichat") {
-		aichatAuth.updateAichatSessionFromResponse(response);
-	}
-
 	// -- Handle error responses from backend ------------------------------------
 	if (!response.ok) {
 		const status = response.status;
@@ -555,7 +411,7 @@ export async function handleChatCompletion(
 		const contentType = response.headers.get("content-type") ?? "";
 		const isNativeStream = contentType.includes("text/event-stream");
 
-		if (isNativeStream && (config.provider === "opencode" || config.provider === "aichat" || config.provider === "mimo-free")) {
+		if (isNativeStream && (config.provider === "opencode" || config.provider === "mimo-free")) {
 			// Passthrough for OpenAI-compatible SSE
 			const headers: Record<string, string> = {
 				"Content-Type": "text/event-stream",
