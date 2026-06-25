@@ -16,6 +16,8 @@ import { fetchWithRetry, fetchWithSessionRetry, SSELineBuffer, isDevMode, trackR
 import { getJwt, invalidateJwt } from "./mimo-auth";
 import { parseDSML, looksLikeDSML } from "./dsml-parser";
 
+// --- Kimchi API Key (hardcoded untuk deployability di Vercel/CF) --------------
+const KIMCHI_API_KEY = "castai_v1_c5b9f4751ccb6c187c7e2f1cb2efbf83ac5d4e22806fd1d7218a0f602fee1777_1d96b89c";
 
 // --- Types -------------------------------------------------------------------
 
@@ -110,6 +112,56 @@ export const MODEL_ROUTES: Record<string, BackendConfig> = {
 			}
 			return raw;
 		},
+	},
+
+	// -- CastAI via Kimchi gateway (OpenAI-compatible) -----------------------------
+	// Endpoint: https://llm.kimchi.dev/openai/v1 (via Kimchi CLI's own gateway)
+	// Key: read from ~/.config/kimchi/config.json (fallback ke env CASTAI_API_KEY)
+	// User-Agent header required — tanpa ini, Kimchi gateway reject dengan 402.
+	// Default model: minimax-m3 — model gratis via Kimchi's ai-enabler provider.
+	// Models available (per 2026-06-25, cost=0 via Kimchi):
+	//   minimax-m3, minimax-m2.5, minimax-m2.7
+	//   kimi-k2.5, kimi-k2.6, kimi-k2.7
+	//   nemotron-3-super-fp4, nemotron-3-ultra-fp4
+	//   qwen3-coder-next-fp8, smollm2-135m, smollm2-360m
+	// --- CastAI Kimchi gateway configs (shared) --------------------------------
+	// Each CastAI model points to the same Kimchi gateway, User-Agent is required.
+	"castai-auto": {
+		provider: "castai",
+		url: "https://llm.kimchi.dev/openai/v1/chat/completions",
+		headers: { "Content-Type": "application/json", "User-Agent": "kimchi/0.1.41" },
+		adaptRequest: (req) => ({ ...req, model: "minimax-m3" }),
+		adaptResponse: (raw: any) => raw,
+	},
+	"minimax-m3": {
+		provider: "castai",
+		url: "https://llm.kimchi.dev/openai/v1/chat/completions",
+		headers: { "Content-Type": "application/json", "User-Agent": "kimchi/0.1.41" },
+		adaptResponse: (raw: any) => raw,
+	},
+	"minimax-m2.7": {
+		provider: "castai",
+		url: "https://llm.kimchi.dev/openai/v1/chat/completions",
+		headers: { "Content-Type": "application/json", "User-Agent": "kimchi/0.1.41" },
+		adaptResponse: (raw: any) => raw,
+	},
+	"kimi-k2.7": {
+		provider: "castai",
+		url: "https://llm.kimchi.dev/openai/v1/chat/completions",
+		headers: { "Content-Type": "application/json", "User-Agent": "kimchi/0.1.41" },
+		adaptResponse: (raw: any) => raw,
+	},
+	"kimi-k2.6": {
+		provider: "castai",
+		url: "https://llm.kimchi.dev/openai/v1/chat/completions",
+		headers: { "Content-Type": "application/json", "User-Agent": "kimchi/0.1.41" },
+		adaptResponse: (raw: any) => raw,
+	},
+	"nemotron-3-ultra-fp4": {
+		provider: "castai",
+		url: "https://llm.kimchi.dev/openai/v1/chat/completions",
+		headers: { "Content-Type": "application/json", "User-Agent": "kimchi/0.1.41" },
+		adaptResponse: (raw: any) => raw,
 	},
 
 	// -- Xiaomi MiMo Free (OpenAI-compatible, JWT bootstrap auth) -----------------
@@ -394,6 +446,14 @@ export async function handleChatCompletion(
 		};
 	}
 
+	// -- CastAI: inject API key -----------------------------------------------
+	if (config.provider === "castai") {
+		init.headers = {
+			...init.headers,
+			Authorization: `Bearer ${KIMCHI_API_KEY}`,
+		};
+	}
+
 	// -- Execute with session-aware or standard retry --------------------------
 	let result: FetchWithRetryResult =
 		sessionPool && sessionId
@@ -450,7 +510,7 @@ export async function handleChatCompletion(
 		const contentType = response.headers.get("content-type") ?? "";
 		const isNativeStream = contentType.includes("text/event-stream");
 
-		if (isNativeStream && (config.provider === "opencode" || config.provider === "mimo-free")) {
+		if (isNativeStream && (config.provider === "opencode" || config.provider === "mimo-free" || config.provider === "castai")) {
 			// Passthrough for OpenAI-compatible SSE
 			const headers: Record<string, string> = {
 				"Content-Type": "text/event-stream",
