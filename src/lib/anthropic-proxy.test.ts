@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { anthropicToBackend } from "./anthropic-proxy";
+import { anthropicToBackend, backendToAnthropicResponse, generateToolUseId } from "./anthropic-proxy";
 import type { BackendConfig } from "./ai-proxy";
 
 const passthroughConfig: BackendConfig = {
@@ -215,5 +215,139 @@ describe("anthropicToBackend", () => {
 		const body = result.body as any;
 		expect(body.messages[0].role).toBe("system");
 		expect(body.messages[0].content).toBe("You are a helpful assistant.");
+	});
+
+	test("should forward tools in request body", () => {
+		const result = anthropicToBackend(
+			{
+				model: "deepseek-v4-flash-free",
+				max_tokens: 100,
+				messages: [{ role: "user", content: "Hi" }],
+				tools: [{ name: "test_tool", input_schema: { type: "object" } }],
+			},
+			passthroughConfig,
+			"deepseek-v4-flash-free",
+		);
+		const body = result.body as any;
+		expect(body.tools).toBeDefined();
+		expect(body.tools).toHaveLength(1);
+		expect(body.tools[0].name).toBe("test_tool");
+	});
+
+	test("should forward tool_choice in request body", () => {
+		const result = anthropicToBackend(
+			{
+				model: "deepseek-v4-flash-free",
+				max_tokens: 100,
+				messages: [{ role: "user", content: "Hi" }],
+				tool_choice: { type: "tool", name: "test_tool" },
+			},
+			passthroughConfig,
+			"deepseek-v4-flash-free",
+		);
+		const body = result.body as any;
+		expect(body.tool_choice).toBeDefined();
+		expect(body.tool_choice.type).toBe("tool");
+	});
+});
+
+describe("backendToAnthropicResponse", () => {
+	test("should convert plain text to text content block", () => {
+		const raw = {
+			id: "test_1",
+			choices: [{ message: { content: "Hello world" }, finish_reason: "stop" }],
+			usage: { prompt_tokens: 10, completion_tokens: 20 },
+		};
+		const result = backendToAnthropicResponse(raw, "deepseek-v4-flash-free");
+		expect(result.content).toHaveLength(1);
+		expect(result.content[0].type).toBe("text");
+		expect((result.content[0] as any).text).toBe("Hello world");
+		expect(result.stop_reason).toBe("end_turn");
+	});
+
+	test("should convert DSML to tool_use content blocks", () => {
+		const raw = {
+			id: "test_2",
+			choices: [{
+				message: { content: `<tool_calls>
+<invoke name="Bash">
+<parameter name="command">ls -la</parameter>
+</invoke>
+</tool_calls>` },
+				finish_reason: "stop",
+			}],
+			usage: { prompt_tokens: 10, completion_tokens: 20 },
+		};
+		const result = backendToAnthropicResponse(raw, "deepseek-v4-flash-free");
+		expect(result.content).toHaveLength(1);
+		expect(result.content[0].type).toBe("tool_use");
+		const toolUse = result.content[0] as any;
+		expect(toolUse.name).toBe("Bash");
+		expect(toolUse.input.command).toBe("ls -la");
+		expect(toolUse.id).toBeTruthy();
+		expect(result.stop_reason).toBe("tool_use");
+	});
+
+	test("should convert text before DSML as separate text block", () => {
+		const raw = {
+			id: "test_3",
+			choices: [{
+				message: { content: "Let me check.\n<tool_calls>\n<invoke name=\"Read\">\n<parameter name=\"path\">/tmp/test</parameter>\n</invoke>\n</tool_calls>" },
+				finish_reason: "stop",
+			}],
+			usage: { prompt_tokens: 5, completion_tokens: 15 },
+		};
+		const result = backendToAnthropicResponse(raw, "deepseek-v4-flash-free");
+		expect(result.content).toHaveLength(2);
+		expect(result.content[0].type).toBe("text");
+		expect(((result.content[0] as any).text).trim()).toBe("Let me check.");
+		expect(result.content[1].type).toBe("tool_use");
+		expect((result.content[1] as any).name).toBe("Read");
+	});
+
+	test("should handle multiple tool calls in DSML", () => {
+		const raw = {
+			id: "test_4",
+			choices: [{
+				message: { content: `<tool_calls>
+<invoke name="Bash">
+<parameter name="command">ls</parameter>
+</invoke>
+<invoke name="Read">
+<parameter name="file_path">test.txt</parameter>
+</invoke>
+</tool_calls>` },
+				finish_reason: "stop",
+			}],
+			usage: { prompt_tokens: 5, completion_tokens: 15 },
+		};
+		const result = backendToAnthropicResponse(raw, "deepseek-v4-flash-free");
+		expect(result.content).toHaveLength(2);
+		expect(result.content[0].type).toBe("tool_use");
+		expect((result.content[0] as any).name).toBe("Bash");
+		expect(result.content[1].type).toBe("tool_use");
+		expect((result.content[1] as any).name).toBe("Read");
+	});
+
+	test("should return plain text when no DSML in response", () => {
+		const raw = {
+			id: "test_5",
+			choices: [{ message: { content: "Hello" }, finish_reason: "stop" }],
+			usage: { prompt_tokens: 5, completion_tokens: 10 },
+		};
+		const result = backendToAnthropicResponse(raw, "deepseek-v4-flash-free");
+		expect(result.content).toHaveLength(1);
+		expect(result.content[0].type).toBe("text");
+		expect(result.stop_reason).toBe("end_turn");
+	});
+});
+
+describe("generateToolUseId", () => {
+	test("should generate unique IDs with toolu_ prefix", () => {
+		const id1 = generateToolUseId();
+		const id2 = generateToolUseId();
+		expect(id1).toMatch(/^toolu_/);
+		expect(id2).toMatch(/^toolu_/);
+		expect(id1).not.toBe(id2);
 	});
 });

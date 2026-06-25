@@ -14,6 +14,7 @@
 import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
 import { fetchWithRetry, fetchWithSessionRetry, SSELineBuffer, isDevMode, trackReader, releaseReader, wrapStreamWithCleanup, type FetchWithRetryResult } from "./fetch-utils";
 import { getJwt, invalidateJwt } from "./mimo-auth";
+import { parseDSML, looksLikeDSML } from "./dsml-parser";
 
 
 // --- Types -------------------------------------------------------------------
@@ -29,6 +30,8 @@ export interface OpenAIRequest {
 	stop?: string | string[];
 	presence_penalty?: number;
 	frequency_penalty?: number;
+	tools?: unknown[];
+	tool_choice?: unknown;
 }
 
 export interface BackendConfig {
@@ -175,7 +178,7 @@ function buildBackendRequest(
 	req: OpenAIRequest,
 	config: BackendConfig,
 ): { url: string; init: RequestInit & { proxy?: string } } {
-	const body =
+	const body: any =
 		config.adaptRequest?.(req) ?? {
 			model: req.model,
 			messages: req.messages,
@@ -185,6 +188,9 @@ function buildBackendRequest(
 			stream: req.stream,
 			stop: req.stop,
 		};
+
+	if (req.tools?.length) body.tools = req.tools;
+	if (req.tool_choice !== undefined) body.tool_choice = req.tool_choice;
 
 	const init: RequestInit & { proxy?: string } = {
 		method: config.method ?? "POST",
@@ -222,6 +228,37 @@ function parseJSONResponse(
 	}
 
 	// Default fallback -- assume raw text is the content
+	const parsedDSML = parseDSML(text);
+
+	if (parsedDSML && parsedDSML.toolCalls.length > 0) {
+		// DSML detected — convert to structured tool_calls
+		return {
+			id: `chatcmpl-${Date.now()}`,
+			object: "chat.completion",
+			created: Math.floor(Date.now() / 1000),
+			model: req.model,
+			choices: [
+				{
+					index: 0,
+					message: {
+						role: "assistant",
+						content: parsedDSML.textBefore || null,
+						tool_calls: parsedDSML.toolCalls.map((tc) => ({
+							id: `call_${crypto.randomUUID().slice(0, 12)}`,
+							type: "function",
+							function: {
+								name: tc.name,
+								arguments: JSON.stringify(tc.args),
+							},
+						})),
+					},
+					finish_reason: "tool_calls",
+				},
+			],
+			usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+		};
+	}
+
 	return {
 		id: `chatcmpl-${Date.now()}`,
 		object: "chat.completion",
@@ -495,6 +532,10 @@ function transformStream(
 	let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
 	const KEEPALIVE_INTERVAL_MS = 15_000;
 
+	// DSML accumulation: buffer text deltas to detect DSML across chunks
+	let dsmlAccumulated = "";
+	let dsmlDetecting = true;
+
 	function startKeepalive(controller: ReadableStreamDefaultController) {
 		if (keepaliveTimer) return;
 		keepaliveTimer = setInterval(() => {
@@ -540,6 +581,45 @@ function transformStream(
 								controller.enqueue(encoder.encode(remaining + "\n\n"));
 							}
 						}
+
+						// Check accumulated text for DSML
+						if (dsmlDetecting) {
+							const parsed = parseDSML(dsmlAccumulated);
+							if (parsed && parsed.toolCalls.length > 0) {
+								// Emit tool_calls delta events
+								for (const tc of parsed.toolCalls) {
+									const toolCallsDelta = {
+										choices: [{
+											index: 0,
+											delta: {
+												tool_calls: [{
+													index: 0,
+													id: `call_${crypto.randomUUID().slice(0, 12)}`,
+													type: "function",
+													function: {
+														name: tc.name,
+														arguments: JSON.stringify(tc.args),
+													},
+												}],
+											},
+											finish_reason: "tool_calls",
+										}],
+									};
+									controller.enqueue(encoder.encode(`data: ${JSON.stringify(toolCallsDelta)}\n\n`));
+								}
+
+								// Final finish event with tool_calls
+								const finishEvent = {
+									choices: [{
+										index: 0,
+										delta: {},
+										finish_reason: "tool_calls",
+									}],
+								};
+								controller.enqueue(encoder.encode(`data: ${JSON.stringify(finishEvent)}\n\n`));
+							}
+						}
+
 						controller.enqueue(encoder.encode("data: [DONE]\n\n"));
 						controller.close();
 						return;
@@ -549,14 +629,30 @@ function transformStream(
 					const lines = lineBuffer.add(chunk);
 
 					for (const line of lines) {
+						let outputLine = line;
 						if (config.adaptStreamLine) {
 							const adapted = config.adaptStreamLine(line, req);
-							if (adapted) {
-								controller.enqueue(encoder.encode(adapted + "\n\n"));
-							}
-						} else {
-							controller.enqueue(encoder.encode(line + "\n\n"));
+							if (!adapted) continue;
+							outputLine = adapted;
 						}
+
+						// Accumulate text content for DSML detection
+						if (dsmlDetecting && outputLine.startsWith("data: ")) {
+							try {
+								const data = JSON.parse(outputLine.slice(6));
+								const content = data.choices?.[0]?.delta?.content;
+								if (typeof content === "string") {
+									dsmlAccumulated += content;
+									if (!looksLikeDSML(dsmlAccumulated) && dsmlAccumulated.length > 1000) {
+										dsmlDetecting = false; // Not DSML, stop checking
+									}
+								}
+							} catch {
+								// Not JSON, skip
+							}
+						}
+
+						controller.enqueue(encoder.encode(outputLine + "\n\n"));
 					}
 
 					chunksProcessed++;

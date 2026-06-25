@@ -13,17 +13,40 @@
 import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
 import { MODEL_ROUTES, type BackendConfig } from "./ai-proxy";
 import { fetchWithRetry, fetchWithSessionRetry, SSELineBuffer, isDevMode, trackReader, releaseReader, wrapStreamWithCleanup, type FetchWithRetryResult } from "./fetch-utils";
+import { parseDSML, looksLikeDSML, isCompleteDSML } from "./dsml-parser";
 
 // --- Types -------------------------------------------------------------------
 
-export interface AnthropicContentBlock {
-	type: "text";
-	text: string;
-	cache_control?: { type: "ephemeral" };
+/** Anthropic tool definition (from request `tools` parameter). */
+export interface AnthropicToolDef {
+	name: string;
+	description?: string;
+	input_schema: Record<string, unknown>;
 }
 
+/** Tool_use content block for Anthropic response. */
+export interface ToolUseBlock {
+	type: "tool_use";
+	id: string;
+	name: string;
+	input: unknown;
+}
+
+/** tool_result content block (user role after tool execution). */
+interface ToolResultBlock {
+	type: "tool_result";
+	tool_use_id: string;
+	content: string;
+}
+
+/** Unified content block type: text, tool_use, or tool_result. */
+export type AnthropicContentBlock =
+	| { type: "text"; text: string; cache_control?: { type: "ephemeral" } }
+	| ToolUseBlock
+	| ToolResultBlock;
+
 export interface AnthropicMessage {
-	role: "user" | "assistant";
+	role: "user" | "assistant" | "tool";
 	content: string | AnthropicContentBlock[];
 }
 
@@ -43,6 +66,8 @@ export interface AnthropicRequest {
 	top_k?: number;
 	stop_sequences?: string[];
 	system?: string | AnthropicSystemBlock[];
+	tools?: AnthropicToolDef[];
+	tool_choice?: unknown;
 	metadata?: Record<string, unknown>;
 }
 
@@ -50,9 +75,9 @@ interface AnthropicResponse {
 	id: string;
 	type: "message";
 	role: "assistant";
-	content: Array<{ type: "text"; text: string }>;
+	content: AnthropicContentBlock[];
 	model: string;
-	stop_reason: "end_turn" | "max_tokens" | "stop_sequence" | null;
+	stop_reason: "end_turn" | "max_tokens" | "stop_sequence" | "tool_use" | null;
 	stop_sequence: string | null;
 	usage: {
 		input_tokens: number;
@@ -60,6 +85,11 @@ interface AnthropicResponse {
 		cache_creation_input_tokens?: number;
 		cache_read_input_tokens?: number;
 	};
+}
+
+/** Generate a unique tool_use ID. @internal Exported for testing. */
+export function generateToolUseId(): string {
+	return `toolu_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
 }
 
 // --- Model resolution ----------------------------------------------------------
@@ -89,6 +119,8 @@ interface BackendBody {
 	top_k?: number;
 	stream?: boolean;
 	stop?: string | string[];
+	tools?: AnthropicToolDef[];
+	tool_choice?: unknown;
 }
 
 /**
@@ -122,26 +154,75 @@ export function anthropicToBackend(
 	// Convert Anthropic content blocks for OpenAI-compatible backend.
 	// When a content block has cache_control, we keep it as a structured
 	// content part so the backend (or downstream cache layer) can use it.
-	const messages: Array<{ role: string; content: string | Array<Record<string, unknown>> }> = anthReq.messages.map((m) => {
+	const messages: Array<{ role: string; content: string | Array<Record<string, unknown>>; tool_calls?: unknown[]; tool_call_id?: string }> = anthReq.messages.map((m) => {
+		// Tool-role messages (OpenAI format after tool_use was executed)
+		if (m.role === "tool") {
+			const msg = m as any;
+			return {
+				role: "tool",
+				content: typeof m.content === "string" ? m.content : "",
+				tool_call_id: msg.tool_use_id ?? "",
+			};
+		}
+
 		if (typeof m.content === "string") {
 			return { role: m.role, content: m.content };
 		}
-		// Check if any block has cache_control — if so, preserve as structured array
-		const hasCacheControl = m.content.some((c) => c.cache_control);
-		if (hasCacheControl) {
-			return {
-				role: m.role,
-				content: m.content.map((c) => {
-					const part: Record<string, unknown> = { type: "text", text: c.text };
-					if (c.cache_control) {
-						part.cache_control = c.cache_control;
-					}
-					return part;
-				}),
-			};
+
+		// Content is an array of blocks — may contain text, tool_use, tool_result
+		const textBlocks: string[] = [];
+		const toolCalls: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }> = [];
+		let isToolResult = false;
+		let toolResultContent = "";
+		let toolResultId = "";
+
+		for (const block of m.content) {
+			if (block.type === "text") {
+				textBlocks.push((block as any).text);
+			} else if (block.type === "tool_use") {
+				toolCalls.push({
+					id: (block as any).id,
+					type: "function",
+					function: {
+						name: (block as any).name,
+						arguments: JSON.stringify((block as any).input ?? {}),
+					},
+				});
+			} else if (block.type === "tool_result") {
+				isToolResult = true;
+				toolResultContent = typeof (block as any).content === "string"
+					? (block as any).content
+					: JSON.stringify((block as any).content);
+				toolResultId = (block as any).tool_use_id ?? "";
+			}
 		}
-		// No cache_control — flatten to plain text for simpler backend processing
-		return { role: m.role, content: m.content.map((c) => c.text).join("") };
+
+		// tool_result blocks come in user-role messages (Anthropic convention)
+		if (isToolResult) {
+			return { role: "tool", content: toolResultContent, tool_call_id: toolResultId };
+		}
+
+		const msg: any = { role: m.role };
+		const hasCacheControl = m.content.some((c) => (c as any).cache_control);
+
+		if (toolCalls.length > 0) {
+			// Assistant with tool calls: content is text, tool_calls separate
+			msg.content = textBlocks.join("");
+			msg.tool_calls = toolCalls;
+		} else if (hasCacheControl) {
+			msg.content = m.content.map((c) => {
+				const part: Record<string, unknown> = { type: "text", text: (c as any).text };
+				if ((c as any).cache_control) {
+					part.cache_control = (c as any).cache_control;
+				}
+				return part;
+			});
+		} else {
+			// No cache_control — flatten to plain text for simpler backend processing
+			msg.content = textBlocks.join("");
+		}
+
+		return msg;
 	});
 
 	// Prepend system prompt as a system message if present.
@@ -179,6 +260,13 @@ export function anthropicToBackend(
 		stream: anthReq.stream,
 	};
 
+	if (anthReq.tools?.length) {
+		base.tools = anthReq.tools;
+	}
+	if (anthReq.tool_choice !== undefined) {
+		base.tool_choice = anthReq.tool_choice;
+	}
+
 	if (anthReq.stop_sequences?.length) {
 		base.stop =
 			anthReq.stop_sequences.length === 1
@@ -191,19 +279,22 @@ export function anthropicToBackend(
 		if (anthropicVersion) {
 			headers["anthropic-version"] = anthropicVersion;
 		}
+		const adaptedReq: any = {
+			model: backendModel,
+			messages,
+			temperature: anthReq.temperature,
+			max_tokens: anthReq.max_tokens,
+			top_p: anthReq.top_p,
+			top_k: anthReq.top_k,
+			stream: anthReq.stream,
+			stop: anthReq.stop_sequences?.length === 1
+				? anthReq.stop_sequences[0]
+				: anthReq.stop_sequences,
+		};
+		if (anthReq.tools?.length) adaptedReq.tools = anthReq.tools;
+		if (anthReq.tool_choice !== undefined) adaptedReq.tool_choice = anthReq.tool_choice;
 		return {
-			body: config.adaptRequest({
-				model: backendModel,
-				messages,
-				temperature: anthReq.temperature,
-				max_tokens: anthReq.max_tokens,
-				top_p: anthReq.top_p,
-				top_k: anthReq.top_k,
-				stream: anthReq.stream,
-				stop: anthReq.stop_sequences?.length === 1
-					? anthReq.stop_sequences[0]
-					: anthReq.stop_sequences,
-			}),
+			body: config.adaptRequest(adaptedReq),
 			headers,
 		};
 	}
@@ -241,23 +332,60 @@ function extractUsage(raw: any): AnthropicResponse["usage"] {
 }
 
 /**
- * Convert a backend JSON response body into Anthropic Messages format.
- * Extracts token usage and cache metrics from the backend response.
+ * Convert a backend JSON response body into Anthropic Messages format,
+ * including DSML tool call detection.
+ *
+ * If the backend text response contains DSML markup (`<tool_calls>`), it is
+ * parsed and converted into Anthropic tool_use content blocks. The text
+ * portion before the DSML remains as a text block. Extracts token usage
+ * and cache metrics from the backend response.
  */
-function backendToAnthropicResponse(
+export function backendToAnthropicResponse(
 	raw: any,
 	model: string,
 ): AnthropicResponse {
 	const text =
 		raw.choices?.[0]?.message?.content ?? raw.content ?? raw.text ?? "";
 
+	const content: AnthropicContentBlock[] = [];
+
+	// Check for DSML in the text
+	const parsedDSML = text ? parseDSML(text) : null;
+
+	if (parsedDSML && parsedDSML.toolCalls.length > 0) {
+		// Add text before DSML if non-empty
+		if (parsedDSML.textBefore) {
+			content.push({ type: "text", text: parsedDSML.textBefore });
+		}
+
+		// Add a tool_use block for each parsed tool call
+		for (const tc of parsedDSML.toolCalls) {
+			content.push({
+				type: "tool_use",
+				id: generateToolUseId(),
+				name: tc.name,
+				input: tc.args,
+			});
+		}
+
+		// Add text after DSML if non-empty
+		if (parsedDSML.textAfter) {
+			content.push({ type: "text", text: parsedDSML.textAfter });
+		}
+	} else {
+		// No DSML — plain text response
+		content.push({ type: "text", text });
+	}
+
 	return {
 		id: raw.id ?? `msg_${Date.now()}`,
 		type: "message",
 		role: "assistant",
-		content: [{ type: "text", text }],
+		content,
 		model,
-		stop_reason: raw.choices?.[0]?.finish_reason === "stop" ? "end_turn" : null,
+		stop_reason: parsedDSML
+			? "tool_use"
+			: (raw.choices?.[0]?.finish_reason === "stop" ? "end_turn" : null),
 		stop_sequence: raw.stop_sequence ?? null,
 		usage: extractUsage(raw),
 	};
@@ -483,16 +611,47 @@ function emitDoneEvents(
 	encoder: TextEncoder,
 	usage: AnthropicResponse["usage"],
 	outputCounter: OutputCounter,
+	dsmlText?: string | null,
 ): void {
 	if (usage.output_tokens === 0 && outputCounter.chars > 0) {
 		usage.output_tokens = Math.max(1, Math.round(outputCounter.chars / 4));
 	}
 
+	// Check DSML buffer for tool calls
+	const dsmlResult = dsmlText ? parseDSML(dsmlText) : null;
+	const hasToolUse = dsmlResult !== null && dsmlResult.toolCalls.length > 0;
+
+	// Close the current text content block
 	controller.enqueue(encoder.encode('event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'));
+
+	// Emit tool_use blocks if DSML was found
+	if (hasToolUse) {
+		let blockIndex = 1;
+		for (const tc of dsmlResult!.toolCalls) {
+			const id = generateToolUseId();
+			// content_block_start for tool_use
+			controller.enqueue(encoder.encode(
+				`event: content_block_start\ndata: ${JSON.stringify({
+					type: "content_block_start",
+					index: blockIndex,
+					content_block: { type: "tool_use", id, name: tc.name, input: tc.args },
+				})}\n\n`,
+			));
+			// content_block_stop (full input available, no incremental delta needed)
+			controller.enqueue(encoder.encode(
+				`event: content_block_stop\ndata: ${JSON.stringify({
+					type: "content_block_stop",
+					index: blockIndex,
+				})}\n\n`,
+			));
+			blockIndex++;
+		}
+	}
+
 	controller.enqueue(encoder.encode(
 		`event: message_delta\ndata: ${JSON.stringify({
 			type: "message_delta",
-			delta: { stop_reason: "end_turn", stop_sequence: null },
+			delta: { stop_reason: hasToolUse ? "tool_use" : "end_turn", stop_sequence: null },
 			usage: { output_tokens: usage.output_tokens },
 		})}\n\n`,
 	));
@@ -519,6 +678,8 @@ function emitErrorEvent(
 /**
  * Process one chunk from the upstream reader through the SSE line buffer
  * and emit adapted Anthropic SSE events for each complete line.
+ * When a DSML buffer is provided, text that looks like DSML is held back
+ * instead of being emitted as text deltas.
  * Returns true if the stream is done (reader returned done=true).
  */
 async function processStreamChunk(
@@ -531,6 +692,7 @@ async function processStreamChunk(
 	config: BackendConfig,
 	usage: AnthropicResponse["usage"],
 	outputCounter: OutputCounter,
+	dsmlBuffer?: DSMLStreamBuffer,
 ): Promise<boolean> {
 	const { done, value } = await reader.read();
 	if (done) {
@@ -538,7 +700,14 @@ async function processStreamChunk(
 		const remaining = lineBuffer.flush();
 		if (remaining.length > 0) {
 			const adapted = backendLineToAnthropicSSE(remaining, model, config, usage, outputCounter);
-			if (adapted) controller.enqueue(encoder.encode(adapted + "\n\n"));
+			if (adapted) {
+				const text = extractTextFromSSEEvent(adapted);
+				if (dsmlBuffer && text) {
+					dsmlBuffer.push(text);
+				} else if (adapted) {
+					controller.enqueue(encoder.encode(adapted + "\n\n"));
+				}
+			}
 		}
 		return true;
 	}
@@ -548,9 +717,62 @@ async function processStreamChunk(
 
 	for (const line of lines) {
 		const adapted = backendLineToAnthropicSSE(line, model, config, usage, outputCounter);
-		if (adapted) controller.enqueue(encoder.encode(adapted + "\n\n"));
+		if (adapted) {
+			const text = extractTextFromSSEEvent(adapted);
+			if (dsmlBuffer && text && (dsmlBuffer.isActive || looksLikeDSML(text))) {
+				dsmlBuffer.push(text);
+			} else {
+				controller.enqueue(encoder.encode(adapted + "\n\n"));
+			}
+		}
 	}
 	return false;
+}
+
+/** Buffer for accumulating DSML content during streaming. */
+interface DSMLStreamBuffer {
+	text: string;
+	isActive: boolean;
+	push(chunk: string): void;
+	flush(): string | null;
+}
+
+function createDSMLStreamBuffer(): DSMLStreamBuffer {
+	let buffer = "";
+	let active = false;
+
+	return {
+		get text() { return buffer; },
+		get isActive() { return active; },
+
+		push(chunk: string) {
+			if (!active && looksLikeDSML(chunk)) {
+				active = true;
+			}
+			buffer += chunk;
+		},
+
+		flush() {
+			if (!buffer) return null;
+			const text = buffer;
+			buffer = "";
+			active = false;
+			return isCompleteDSML(text) ? text : null;
+		},
+	};
+}
+
+/** Extract plain text from a formatted content_block_delta SSE event. */
+function extractTextFromSSEEvent(event: string): string | null {
+	if (!event.startsWith("event: content_block_delta")) return null;
+	const dataMatch = event.match(/data:\s*(\{.*\})/);
+	if (!dataMatch) return null;
+	try {
+		const parsed = JSON.parse(dataMatch[1]);
+		return parsed.delta?.text ?? null;
+	} catch {
+		return null;
+	}
 }
 
 // --- Stream transformer --------------------------------------------------------
@@ -568,6 +790,7 @@ function transformAnthropicStream(
 	let phase: "init" | "block" | "done" = "init";
 	const outputCounter: OutputCounter = { chars: 0 };
 	const usage: AnthropicResponse["usage"] = { input_tokens: 0, output_tokens: 0 };
+	const dsmlBuffer = createDSMLStreamBuffer();
 
 	let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
 	const KEEPALIVE_INTERVAL_MS = 15_000;
@@ -597,7 +820,7 @@ function transformAnthropicStream(
 				let chunksProcessed = 0;
 
 				while (phase === "block" && chunksProcessed < BATCH_SIZE) {
-					const isDone = await processStreamChunk(reader, lineBuffer, decoder, controller, encoder, model, config, usage, outputCounter);
+					const isDone = await processStreamChunk(reader, lineBuffer, decoder, controller, encoder, model, config, usage, outputCounter, dsmlBuffer);
 					if (isDone) {
 						stopKeepalive();
 						releaseReader(reader);
@@ -613,7 +836,8 @@ function transformAnthropicStream(
 				}
 
 				if (phase === "done") {
-					emitDoneEvents(controller, encoder, usage, outputCounter);
+					const dsmlText = dsmlBuffer.flush();
+					emitDoneEvents(controller, encoder, usage, outputCounter, dsmlText);
 				}
 			} catch (err) {
 				stopKeepalive();
