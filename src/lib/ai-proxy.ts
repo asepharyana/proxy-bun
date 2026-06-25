@@ -264,7 +264,9 @@ function validateChatRequest(body: unknown): ValidationError | null {
 		if (!msg.role || typeof msg.role !== "string") {
 			return { message: `messages[${i}].role is required`, type: "invalid_request_error" };
 		}
-		if (msg.content == null) {
+		// content is required on user messages; assistant messages may have
+		// content=null when they carry tool_calls instead.
+		if (msg.content == null && msg.role !== "assistant") {
 			return { message: `messages[${i}].content is required`, type: "invalid_request_error" };
 		}
 	}
