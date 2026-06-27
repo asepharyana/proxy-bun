@@ -63,7 +63,7 @@ export class ResponseCache {
 
   /** Build a deterministic cache key from an LLM request. */
   static buildKey(model: string, messages: unknown, stream: boolean): string {
-    const stable = JSON.stringify(messages, stableStringifyReplacer);
+    const stable = stableStringifyCached(messages);
     const raw = `${model}|${stream}|${stable}`;
     return simpleHash(raw);
   }
@@ -201,6 +201,30 @@ function stableStringifyReplacer(_key: string, value: unknown): unknown {
     return sorted;
   }
   return value;
+}
+
+/**
+ * WeakMap cache for stableStringify output — avoids re-stringifying the same
+ * request body across retries or repeated identical requests within the same
+ * process lifetime. Keyed by the top-level messages reference; entries are
+ * collected once the request body is GC'd.
+ */
+const _stableStringifyCache = new WeakMap<object, string>();
+
+/**
+ * Memoized stable JSON.stringify for buildKey. Re-using the same `messages`
+ * reference across retries hits the WeakMap and skips the recursive sort.
+ * Falls back to direct stringify when the value isn't a referenceable object.
+ */
+function stableStringifyCached(value: unknown): string {
+  if (value && typeof value === "object") {
+    const hit = _stableStringifyCache.get(value as object);
+    if (hit !== undefined) return hit;
+    const s = JSON.stringify(value, stableStringifyReplacer);
+    _stableStringifyCache.set(value as object, s);
+    return s;
+  }
+  return JSON.stringify(value, stableStringifyReplacer);
 }
 
 /**

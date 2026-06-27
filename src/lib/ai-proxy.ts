@@ -12,7 +12,7 @@
  */
 
 import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
-import { fetchWithRetry, fetchWithSessionRetry, SSELineBuffer, isDevMode, trackReader, releaseReader, wrapStreamWithCleanup, type FetchWithRetryResult } from "./fetch-utils";
+import { fetchWithRetry, fetchWithSessionRetry, SSELineBuffer, isDevMode, trackReader, releaseReader, wrapStreamWithCleanup, SHARED_ENCODER, withTrackedReader, type FetchWithRetryResult } from "./fetch-utils";
 import { getJwt, invalidateJwt } from "./mimo-auth";
 import { parseDSML, looksLikeDSML } from "./dsml-parser";
 import { getResponseCache, isDSMLDetectionEnabled, isStreamPassthroughEnabled, ResponseCache } from "./response-cache";
@@ -430,10 +430,13 @@ export async function handleChatCompletion(
 	const { url, init } = buildBackendRequest(req, config);
 
 	// -- Cache check (non-streaming only) ------------------------------------
+	// Skip buildKey entirely if the model isn't on the cache allowlist —
+	// buildKey's JSON.stringify + sort is wasted work otherwise.
 	const cache = getResponseCache();
-	const cacheKey = !wantsStream && cache
-		? ResponseCache.buildKey(req.model, req.messages, wantsStream)
-		: null;
+	const cacheKey =
+		!wantsStream && cache && cache.shouldCacheModel(req.model)
+			? ResponseCache.buildKey(req.model, req.messages, wantsStream)
+			: null;
 	if (cacheKey && cache) {
 		const cached = cache.get(cacheKey);
 		if (cached) {
@@ -568,15 +571,20 @@ export async function handleChatCompletion(
 	const adapted = parseJSONResponse(text, config, req);
 
 	// -- Store in cache --------------------------------------------------------
+	// Compute the JSON body ONCE — used by both cache.set and the Response below.
+	// Previously this was stringified twice (once for cache, once for return).
+	let responseBody: string;
 	if (cacheKey && cache) {
-		const responseBody = JSON.stringify(adapted);
+		responseBody = JSON.stringify(adapted);
 		cache.set(cacheKey, responseBody, 200, {});
 		if (isDevMode()) {
 			console.log(`[ai-proxy] cache MISS for model=${req.model} key=${cacheKey.slice(0, 12)} — stored`);
 		}
+	} else {
+		responseBody = JSON.stringify(adapted);
 	}
 
-	return new Response(JSON.stringify(adapted), {
+	return new Response(responseBody, {
 		status: 200,
 		headers: {
 			"Content-Type": "application/json",
@@ -608,7 +616,8 @@ function transformStream(
 ): ReadableStream {
 	const reader = trackReader(body.getReader() as any as ReadableStreamDefaultReader);
 	const decoder = new TextDecoder();
-	const encoder = new TextEncoder();
+	// Use shared stateless encoder to avoid per-stream allocation.
+	const encoder = SHARED_ENCODER;
 	const lineBuffer = new SSELineBuffer();
 
 	// SSE keepalive: send a comment every 15s to prevent LB/proxy timeout
@@ -619,6 +628,16 @@ function transformStream(
 	// Only active for models known to produce DSML (e.g. deepseek, codestral).
 	let dsmlAccumulated = "";
 	let dsmlDetecting = isDSMLDetectionEnabled(req.model);
+
+	// Track whether the reader has already been released from ACTIVE_READERS.
+	// Guarded so the finally block is idempotent (no double delete).
+	let readerReleased = false;
+	function safeReleaseReader() {
+		if (!readerReleased) {
+			readerReleased = true;
+			releaseReader(reader);
+		}
+	}
 
 	function startKeepalive(controller: ReadableStreamDefaultController) {
 		if (keepaliveTimer) return;
@@ -652,7 +671,7 @@ function transformStream(
 					const { done, value } = await reader.read();
 					if (done) {
 						stopKeepalive();
-						releaseReader(reader);
+						safeReleaseReader();
 						// Flush remaining text after stream ends
 						const remaining = lineBuffer.flush();
 						if (remaining.length > 0) {
@@ -748,7 +767,7 @@ function transformStream(
 				}
 			} catch (err) {
 				stopKeepalive();
-				releaseReader(reader);
+				safeReleaseReader();
 				if (isDevMode()) {
 					controller.enqueue(
 						encoder.encode(

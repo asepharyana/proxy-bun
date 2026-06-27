@@ -7,6 +7,18 @@
 
 import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
 
+// ─── Shared stateless encoders (safe to reuse across streams) ──────────────
+
+/**
+ * Module-level singleton TextEncoder. Stateless and immutable in the Web
+ * Streams API — safe to share across all streaming responses to avoid
+ * per-stream allocation churn under high RPS.
+ *
+ * Note: TextDecoder is stateful (utf-8 code-point state), so it MUST
+ * stay per-stream — don't be tempted to share it.
+ */
+export const SHARED_ENCODER = new TextEncoder();
+
 // ─── Active stream tracking (for graceful shutdown) ───────────────────────
 
 /** Set of active ReadableStream readers that should be closed on shutdown. */
@@ -33,9 +45,29 @@ export function trackReader<T extends ReadableStreamDefaultReader<any>>(reader: 
 /**
  * Release a reader from the active tracking set.
  * Call this when a stream finishes normally (reader.read() returns done=true).
+ *
+ * Note: Idempotent — safe to call from both success and finally paths.
  */
 export function releaseReader(reader: ReadableStreamDefaultReader<any>): void {
   ACTIVE_READERS.delete(reader as any);
+}
+
+/**
+ * Track if not already tracked, then run `fn` and ALWAYS release the reader
+ * on exit (success OR exception). Use this for streaming transforms where
+ * exceptions in middleware (decoder, encoder, controller) could otherwise
+ * skip the manual releaseReader call and leak the reader.
+ */
+export async function withTrackedReader<T extends ReadableStreamDefaultReader<any>>(
+  reader: T,
+  fn: () => Promise<void>,
+): Promise<void> {
+  trackReader(reader);
+  try {
+    await fn();
+  } finally {
+    releaseReader(reader);
+  }
 }
 
 /**

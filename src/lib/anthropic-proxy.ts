@@ -12,7 +12,7 @@
 
 import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
 import { MODEL_ROUTES, type BackendConfig } from "./ai-proxy";
-import { fetchWithRetry, fetchWithSessionRetry, SSELineBuffer, isDevMode, trackReader, releaseReader, wrapStreamWithCleanup, type FetchWithRetryResult } from "./fetch-utils";
+import { fetchWithRetry, fetchWithSessionRetry, SSELineBuffer, isDevMode, trackReader, releaseReader, wrapStreamWithCleanup, SHARED_ENCODER, type FetchWithRetryResult } from "./fetch-utils";
 import { parseDSML, looksLikeDSML, isCompleteDSML } from "./dsml-parser";
 import { getResponseCache, isDSMLDetectionEnabled, ResponseCache } from "./response-cache";
 
@@ -702,12 +702,16 @@ async function processStreamChunk(
 		if (remaining.length > 0) {
 			const adapted = backendLineToAnthropicSSE(remaining, model, config, usage, outputCounter);
 			if (adapted) {
-				const text = extractTextFromSSEEvent(adapted);
-				if (dsmlBuffer && text) {
-					dsmlBuffer.push(text);
-				} else if (adapted) {
-					controller.enqueue(encoder.encode(adapted + "\n\n"));
+				// Only parse for DSML text if detection is enabled.
+				if (dsmlBuffer) {
+					const text = extractTextFromSSEEvent(adapted);
+					if (text && (dsmlBuffer.isActive || looksLikeDSML(text))) {
+						dsmlBuffer.push(text);
+						// Stream is done — dsml will be flushed in emitDoneEvents.
+						return true;
+					}
 				}
+				controller.enqueue(encoder.encode(adapted + "\n\n"));
 			}
 		}
 		return true;
@@ -719,12 +723,16 @@ async function processStreamChunk(
 	for (const line of lines) {
 		const adapted = backendLineToAnthropicSSE(line, model, config, usage, outputCounter);
 		if (adapted) {
-			const text = extractTextFromSSEEvent(adapted);
-			if (dsmlBuffer && text && (dsmlBuffer.isActive || looksLikeDSML(text))) {
-				dsmlBuffer.push(text);
-			} else {
-				controller.enqueue(encoder.encode(adapted + "\n\n"));
+			// Only parse SSE event for text if DSML detection is enabled.
+			// Otherwise the regex + JSON.parse is wasted work on every chunk.
+			if (dsmlBuffer) {
+				const text = extractTextFromSSEEvent(adapted);
+				if (text && (dsmlBuffer.isActive || looksLikeDSML(text))) {
+					dsmlBuffer.push(text);
+					continue;
+				}
 			}
+			controller.enqueue(encoder.encode(adapted + "\n\n"));
 		}
 	}
 	return false;
@@ -763,13 +771,30 @@ function createDSMLStreamBuffer(): DSMLStreamBuffer {
 	};
 }
 
-/** Extract plain text from a formatted content_block_delta SSE event. */
+/**
+ * Extract plain text from a formatted content_block_delta SSE event.
+ *
+ * Hot path — called once per SSE line during streaming. Avoid regex
+ * backtracking by manually locating the JSON braces with indexOf.
+ */
 function extractTextFromSSEEvent(event: string): string | null {
+	// Fast path: most SSE lines are NOT content_block_delta — bail in ~1 op.
 	if (!event.startsWith("event: content_block_delta")) return null;
-	const dataMatch = event.match(/data:\s*(\{.*\})/);
-	if (!dataMatch) return null;
+
+	// Skip the "event: ..." header (already past, but data: comes after newline)
+	const dataIdx = event.indexOf("data:");
+	if (dataIdx < 0) return null;
+
+	// Find the JSON object bounds manually — avoids regex backtracking on
+	// long lines. We want the FIRST '{' after `data:` and the matching '}'
+	// at the end (SSE data is always single-line JSON).
+	const jsonStart = event.indexOf("{", dataIdx);
+	if (jsonStart < 0) return null;
+	const jsonEnd = event.lastIndexOf("}");
+	if (jsonEnd <= jsonStart) return null;
+
 	try {
-		const parsed = JSON.parse(dataMatch[1]);
+		const parsed = JSON.parse(event.slice(jsonStart, jsonEnd + 1));
 		return parsed.delta?.text ?? null;
 	} catch {
 		return null;
@@ -784,7 +809,8 @@ function transformAnthropicStream(
 	config: BackendConfig,
 ): ReadableStream {
 	const reader = trackReader(body.getReader() as any as ReadableStreamDefaultReader);
-	const encoder = new TextEncoder();
+	// Use shared stateless encoder to avoid per-stream allocation.
+	const encoder = SHARED_ENCODER;
 	const decoder = new TextDecoder();
 	const lineBuffer = new SSELineBuffer();
 
@@ -795,6 +821,16 @@ function transformAnthropicStream(
 
 	let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
 	const KEEPALIVE_INTERVAL_MS = 30_000;
+
+	// Idempotent reader release — guards against double-release in finally blocks
+	// if both the success path and catch handler try to release the same reader.
+	let readerReleased = false;
+	function safeReleaseReader() {
+		if (!readerReleased) {
+			readerReleased = true;
+			safeReleaseReader();
+		}
+	}
 
 	function startKeepalive(controller: ReadableStreamDefaultController) {
 		if (keepaliveTimer) return;
@@ -824,7 +860,7 @@ function transformAnthropicStream(
 					const isDone = await processStreamChunk(reader, lineBuffer, decoder, controller, encoder, model, config, usage, outputCounter, dsmlBuffer);
 					if (isDone) {
 						stopKeepalive();
-						releaseReader(reader);
+						safeReleaseReader();
 						phase = "done";
 						break;
 					}
@@ -842,7 +878,7 @@ function transformAnthropicStream(
 				}
 			} catch (err) {
 				stopKeepalive();
-				releaseReader(reader);
+				safeReleaseReader();
 				emitErrorEvent(controller, encoder, err);
 			}
 		},
@@ -1061,10 +1097,13 @@ export async function handleAnthropicMessages(
 	const version = anthropicVersion || "2023-06-01";
 
 	// -- Cache check (non-streaming only) ------------------------------------
+	// Skip buildKey entirely if the model isn't on the cache allowlist —
+	// buildKey's JSON.stringify + sort is wasted work otherwise.
 	const cache = getResponseCache();
-	const cacheKey = !wantsStream && cache
-		? ResponseCache.buildKey(req.model, req.messages, wantsStream)
-		: null;
+	const cacheKey =
+		!wantsStream && cache && cache.shouldCacheModel(req.model)
+			? ResponseCache.buildKey(req.model, req.messages, wantsStream)
+			: null;
 	if (cacheKey && cache) {
 		const cached = cache.get(cacheKey);
 		if (cached) {
@@ -1169,15 +1208,20 @@ export async function handleAnthropicMessages(
 	const adapted = backendToAnthropicResponse(parsed, req.model);
 
 	// -- Store in cache --------------------------------------------------------
+	// Compute the JSON body ONCE — used by both cache.set and the Response below.
+	// Previously this was stringified twice (once for cache, once for return).
+	let responseBody: string;
 	if (cacheKey && cache) {
-		const responseBody = JSON.stringify(adapted);
+		responseBody = JSON.stringify(adapted);
 		cache.set(cacheKey, responseBody, 200, {});
 		if (isDevMode()) {
 			console.log(`[anthropic-proxy] cache MISS for model=${req.model} key=${cacheKey.slice(0, 12)} — stored`);
 		}
+	} else {
+		responseBody = JSON.stringify(adapted);
 	}
 
-	return new Response(JSON.stringify(adapted), {
+	return new Response(responseBody, {
 		status: 200,
 		headers: buildJsonHeaders(response),
 	});

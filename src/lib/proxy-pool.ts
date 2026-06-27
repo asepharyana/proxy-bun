@@ -38,8 +38,11 @@ export class ProxyPool {
 	private failureThreshold = 3;
 	/** host:port -> consecutive failure count */
 	private failures = new Map<string, number>();
-	/** host:port::model -> expiry epoch ms */
+	/** host:port::model -> expiry epoch ms. Bounded by MAX_COOLDOWNS to prevent
+	 *  unbounded growth when many unique (proxy, model) pairs receive 429s. */
 	private cooldowns = new Map<string, number>();
+	/** Cap on cooldown entries. Oldest (by insertion order) is evicted on overflow. */
+	private readonly MAX_COOLDOWNS = 10_000;
 	private cooldownDuration = 60000; // default 60s
 	/** Periodic cleanup timer for expired cooldowns */
 	private cleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -148,6 +151,17 @@ export class ProxyPool {
 		// Allow process to exit even if timer is active
 		if (this.cleanupTimer && typeof this.cleanupTimer === "object" && "unref" in this.cleanupTimer) {
 			this.cleanupTimer.unref();
+		}
+	}
+
+	/**
+	 * Evict oldest cooldown entries when over capacity. Insertion order in
+	 * Map is preserved — the first key iterated is the oldest.
+	 */
+	private evictOldestCooldown(): void {
+		const oldestKey = this.cooldowns.keys().next().value;
+		if (oldestKey !== undefined) {
+			this.cooldowns.delete(oldestKey);
 		}
 	}
 
@@ -353,12 +367,21 @@ export class ProxyPool {
 	 * Mark the **current** proxy as rate-limited for a specific model.
 	 * The proxy enters a cooldown period during which it will be skipped
 	 * for this model but remains available for other models.
+	 *
+	 * Bounded: when cooldowns exceeds MAX_COOLDOWNS, the oldest entry is
+	 * evicted (insertion-order LRU) to prevent memory growth across
+	 * many unique (proxy, model) pairs.
 	 */
 	markRateLimited(model: string): void {
 		const entry = this.getCurrent();
 		if (!entry) return;
 		const key = this.cooldownKey(entry.host, entry.port, model);
 		const expiry = Date.now() + this.cooldownDuration;
+
+		// If at capacity and this is a new key, evict oldest first.
+		if (!this.cooldowns.has(key) && this.cooldowns.size >= this.MAX_COOLDOWNS) {
+			this.evictOldestCooldown();
+		}
 		this.cooldowns.set(key, expiry);
 		logPool(`markRateLimited key=${key} expiry=${expiry} duration=${this.cooldownDuration}ms`);
 	}
