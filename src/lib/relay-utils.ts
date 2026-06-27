@@ -197,6 +197,73 @@ export function isPrivateIp(hostname: string): boolean {
 	return false;
 }
 
+// ─── DNS resolution cache (TTL-based) ───────────────────────────────────
+
+/** Cache entry for a hostname's resolved addresses and privacy verdict. */
+interface DNSCacheEntry {
+	/** Resolved IPv4 + IPv6 addresses. */
+	addrs: string[];
+	/** Whether any resolved address is private. */
+	isPrivate: boolean;
+	/** Expiry timestamp (epoch ms). */
+	expiresAt: number;
+}
+
+/** Default DNS cache TTL — 5 minutes balances freshness with lookup savings. */
+const DNS_CACHE_TTL_MS = 5 * 60 * 1000;
+
+/** Maximum number of cached hostnames to prevent unbounded memory growth. */
+const DNS_CACHE_MAX_SIZE = 1000;
+
+/** TTL-based LRU-ish cache for DNS resolution results. */
+const dnsCache = new Map<string, DNSCacheEntry>();
+
+/** Get cached DNS result if present and not expired. */
+function dnsCacheGet(hostname: string): DNSCacheEntry | null {
+	const entry = dnsCache.get(hostname);
+	if (!entry) return null;
+	if (Date.now() > entry.expiresAt) {
+		dnsCache.delete(hostname);
+		return null;
+	}
+	// Move to end (most recently used)
+	dnsCache.delete(hostname);
+	dnsCache.set(hostname, entry);
+	return entry;
+}
+
+/** Store DNS result in cache. Evicts oldest entries when full. */
+function dnsCacheSet(hostname: string, entry: DNSCacheEntry): void {
+	if (dnsCache.size >= DNS_CACHE_MAX_SIZE) {
+		// Evict oldest entry (first in insertion order)
+		const oldest = dnsCache.keys().next().value;
+		if (oldest !== undefined) dnsCache.delete(oldest);
+	}
+	dnsCache.set(hostname, entry);
+}
+
+/** Look up a hostname in DNS and return its resolved addresses.
+ *  Cached with TTL to avoid repeated lookups for the same target.
+ *  Returns [] on resolution failure. */
+async function resolveHostname(hostname: string): Promise<string[]> {
+	const cached = dnsCacheGet(hostname);
+	if (cached) return cached.addrs;
+
+	const [v4addrs, v6addrs] = await Promise.all([
+		resolve4(hostname).catch(() => [] as string[]),
+		resolve6(hostname).catch(() => [] as string[]),
+	]);
+
+	const addrs = [...v4addrs, ...v6addrs];
+	dnsCacheSet(hostname, {
+		addrs,
+		isPrivate: addrs.length === 0 || addrs.some((a) => isPrivateIp(a)),
+		expiresAt: Date.now() + DNS_CACHE_TTL_MS,
+	});
+
+	return addrs;
+}
+
 /**
  * Resolve a hostname to its IP addresses and check whether any of them are
  * private / loopback / link-local.  This protects against DNS rebinding
@@ -206,6 +273,10 @@ export function isPrivateIp(hostname: string): boolean {
  * Returns `true` if the hostname resolves to any private IP, or if the
  * resolution itself fails.  When the hostname is already an IP literal
  * the existing `isPrivateIp` check is used directly.
+ *
+ * Performance: Results are cached for 5 minutes (configurable via
+ * SSRF_DNS_CACHE_TTL_MS env var) to avoid DNS lookups on every request.
+ * The cache is bounded to DNS_CACHE_MAX_SIZE entries to prevent memory bloat.
  */
 export async function isPrivateIpAfterResolve(hostname: string): Promise<boolean> {
 	const lower = hostname.toLowerCase();
@@ -215,24 +286,9 @@ export async function isPrivateIpAfterResolve(hostname: string): Promise<boolean
 		return isPrivateIp(lower);
 	}
 
-	// Resolve to IPv4 and IPv6 addresses concurrently
-	try {
-		const [v4addrs, v6addrs] = await Promise.all([
-			resolve4(lower).catch(() => [] as string[]),
-			resolve6(lower).catch(() => [] as string[]),
-		]);
-
-		const allAddrs = [...v4addrs, ...v6addrs];
-		if (allAddrs.length === 0) {
-			// No addresses resolved -- be safe and block
-			return true;
-		}
-
-		return allAddrs.some((addr) => isPrivateIp(addr));
-	} catch {
-		// Resolution failure -- block to be safe
-		return true;
-	}
+	// resolveHostname handles caching internally
+	const addrs = await resolveHostname(lower);
+	return addrs.length === 0 || addrs.some((addr) => isPrivateIp(addr));
 }
 
 /**

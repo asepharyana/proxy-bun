@@ -281,7 +281,7 @@ function parseJSONResponse(
 	}
 
 	// Default fallback -- assume raw text is the content
-	const parsedDSML = parseDSML(text);
+	const parsedDSML = isDSMLDetectionEnabled(req.model) ? parseDSML(text) : null;
 
 	if (parsedDSML && parsedDSML.toolCalls.length > 0) {
 		// DSML detected — convert to structured tool_calls
@@ -613,11 +613,12 @@ function transformStream(
 
 	// SSE keepalive: send a comment every 15s to prevent LB/proxy timeout
 	let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
-	const KEEPALIVE_INTERVAL_MS = 15_000;
+	const KEEPALIVE_INTERVAL_MS = 30_000;
 
-	// DSML accumulation: buffer text deltas to detect DSML across chunks
+	// DSML accumulation: buffer text deltas to detect DSML across chunks.
+	// Only active for models known to produce DSML (e.g. deepseek, codestral).
 	let dsmlAccumulated = "";
-	let dsmlDetecting = isDSMLDetectionEnabled();
+	let dsmlDetecting = isDSMLDetectionEnabled(req.model);
 
 	function startKeepalive(controller: ReadableStreamDefaultController) {
 		if (keepaliveTimer) return;
@@ -644,7 +645,7 @@ function transformStream(
 				startKeepalive(controller);
 				// Process multiple chunks before yielding to event loop
 				// to reduce per-chunk setTimeout overhead (~1-4ms each)
-				const BATCH_SIZE = 8;
+				const BATCH_SIZE = 32;
 				let chunksProcessed = 0;
 
 				while (true) {

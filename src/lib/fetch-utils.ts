@@ -177,11 +177,15 @@ function extractModel(context?: string): string | undefined {
 /**
  * Calculate exponential backoff delay for retry attempts.
  * Returns 0 for attempt 0 (no delay on first try).
- * Pattern: 200ms, 400ms, 800ms, ... capped at 2000ms.
+ * Pattern: 50ms, 100ms, 200ms, ... capped at 500ms.
+ *
+ * Reduced from 200ms base / 2000ms cap → 50ms base / 500ms cap to
+ * minimize time wasted on failed retries while still giving the
+ * upstream a brief moment to recover.
  */
 function retryBackoffMs(attempt: number): number {
   if (attempt <= 0) return 0;
-  return Math.min(200 * Math.pow(2, attempt - 1), 2000);
+  return Math.min(50 * Math.pow(2, attempt - 1), 500);
 }
 
 /** Sleep for the specified milliseconds. */
@@ -223,6 +227,8 @@ export interface FetchWithRetryResult {
  * Execute an upstream `fetch` with automatic retry and proxy rotation.
  *
  * Strategy: direct connection first, then fall back to proxies.
+ * Default: 1 attempt (direct only). Set MAX_RETRIES=2+ to enable
+ * proxy fallback with retry.
  * Falls back to direct when no pool is available.
  * Logs every failure to `console.warn` so the operator can diagnose without
  * the error body leaking to the downstream client.
@@ -238,8 +244,10 @@ export async function fetchWithRetry(
   let usedProxy = false;
 
   // Strategy: direct first, then proxies as fallback.
-  // Default: 2 attempts (1 direct + 1 proxy fallback). Override via MAX_RETRIES env.
-  const MAX_RETRIES = Number(process.env.MAX_RETRIES ?? 2);
+  // Default: 1 attempt (direct only — retry only when proxy pool is available
+  // and explicit MAX_RETRIES>1 is set). Reduced from 2 to minimize wasted
+  // latency on failed requests when the upstream is already slow/broken.
+  const MAX_RETRIES = Number(process.env.MAX_RETRIES ?? 1);
   const poolSize = proxyPool?.size ?? 0;
   const maxAttempts = Math.min(MAX_RETRIES, poolSize > 0 ? poolSize + 1 : MAX_RETRIES);
 
@@ -409,8 +417,8 @@ export async function fetchWithSessionRetry(
 
   // Strategy: direct first, then session-sticky proxies as fallback.
   // Default: 2 attempts (1 direct + 1 proxy fallback). Override via MAX_RETRIES env.
-  const MAX_RETRIES = Number(process.env.MAX_RETRIES ?? 2);
-  const totalAttempts = maxRetries ?? Math.min(MAX_RETRIES, Math.max(2, sessionPool.size + 1));
+  const MAX_RETRIES = Number(process.env.MAX_RETRIES ?? 1);
+  const totalAttempts = maxRetries ?? Math.min(MAX_RETRIES, Math.max(1, sessionPool.size + 1));
   let lastError: unknown;
   let lastResponse: Response | undefined;
   for (let attempt = 0; attempt < totalAttempts; attempt++) {

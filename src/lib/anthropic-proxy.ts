@@ -350,8 +350,8 @@ export function backendToAnthropicResponse(
 
 	const content: AnthropicContentBlock[] = [];
 
-	// Check for DSML in the text
-	const parsedDSML = text ? parseDSML(text) : null;
+	// Check for DSML in the text (only for models known to produce it)
+	const parsedDSML = text && isDSMLDetectionEnabled(model) ? parseDSML(text) : null;
 
 	if (parsedDSML && parsedDSML.toolCalls.length > 0) {
 		// Add text before DSML if non-empty
@@ -791,10 +791,10 @@ function transformAnthropicStream(
 	let phase: "init" | "block" | "done" = "init";
 	const outputCounter: OutputCounter = { chars: 0 };
 	const usage: AnthropicResponse["usage"] = { input_tokens: 0, output_tokens: 0 };
-	const dsmlBuffer = isDSMLDetectionEnabled() ? createDSMLStreamBuffer() : null;
+	const dsmlBuffer = isDSMLDetectionEnabled(model) ? createDSMLStreamBuffer() : null;
 
 	let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
-	const KEEPALIVE_INTERVAL_MS = 15_000;
+	const KEEPALIVE_INTERVAL_MS = 30_000;
 
 	function startKeepalive(controller: ReadableStreamDefaultController) {
 		if (keepaliveTimer) return;
@@ -817,7 +817,7 @@ function transformAnthropicStream(
 					emitInitEvents(controller, encoder, model, `msg_${Date.now()}`, usage);
 				}
 
-				const BATCH_SIZE = 8;
+				const BATCH_SIZE = 32;
 				let chunksProcessed = 0;
 
 				while (phase === "block" && chunksProcessed < BATCH_SIZE) {

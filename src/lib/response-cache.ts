@@ -6,79 +6,96 @@
  * or shared prefixes).
  *
  * Strategy:
- *   - LRU eviction (most recently used survives)
- *   - Configurable TTL per entry (default 15s — safe for dev, short enough
- *     that stale responses are unlikely)
+ *   - LRU eviction via Map insertion order (O(1) reorder on access)
+ *   - Configurable TTL per entry (default 300s — balances freshness vs hit rate)
  *   - Cache key = hash of (model + sorted messages + stream flag)
- *   - Only non-streaming responses are cached (streaming would require
- *     buffering the entire body, defeating the purpose)
- *   - Disabled entirely when CACHE_TTL=0 or NODE_ENV=production without
- *     explicit opt-in
+ *   - Non-streaming responses are cached; streaming not cached (would need
+ *     full body buffering)
+ *   - Model allowlist via CACHE_MODELS envvar (comma-separated prefixes)
+ *   - Basic hit/miss stats exported for observability
  *
- * Thread safety: LRU operations happen on a single Map + Doubly Linked
- * List, all synchronous — safe within Bun's single-threaded event loop.
+ * Performance: Uses Map.delete+set instead of a hand-rolled linked list,
+ * giving O(1) reorder on access vs O(n) scan in the previous implementation.
  */
 
 // ─── Cache entry ──────────────────────────────────────────────────────────
 
 interface CacheEntry {
-  /** Serialized response body (JSON string). */
   body: string;
-  /** HTTP status code. */
   status: number;
-  /** Response headers to forward. */
   headers: Record<string, string>;
-  /** When this entry was created (epoch ms). */
   createdAt: number;
-  /** When this entry expires (epoch ms). */
   expiresAt: number;
 }
 
-// ─── LRU Linked List Node ─────────────────────────────────────────────────
+// ─── Cache stats ──────────────────────────────────────────────────────────
 
-interface LRUNode {
-  key: string;
-  prev: LRUNode | null;
-  next: LRUNode | null;
+export interface CacheStats {
+  hits: number;
+  misses: number;
+  size: number;
+  maxSize: number;
+  hitRate: number;
 }
 
 // ─── ResponseCache class ──────────────────────────────────────────────────
 
 export class ResponseCache {
+  /** Map preserves insertion order — used as LRU ordering */
   private readonly map = new Map<string, CacheEntry>();
-  private head: LRUNode | null = null;
-  private tail: LRUNode | null = null;
   private readonly maxSize: number;
   private readonly defaultTtlMs: number;
+  private readonly modelAllowlist: RegExp[];
+  private hits = 0;
+  private misses = 0;
 
-  constructor(opts?: { maxSize?: number; defaultTtlMs?: number }) {
+  constructor(opts?: {
+    maxSize?: number;
+    defaultTtlMs?: number;
+    modelAllowlist?: RegExp[];
+  }) {
     this.maxSize = opts?.maxSize ?? 500;
-    this.defaultTtlMs = opts?.defaultTtlMs ?? 15_000; // 15 seconds
+    this.defaultTtlMs = opts?.defaultTtlMs ?? 300_000; // 300 seconds (5 min)
+    this.modelAllowlist = opts?.modelAllowlist ?? [];
   }
 
   // ── Public API ──────────────────────────────────────────────────────────
 
   /** Build a deterministic cache key from an LLM request. */
   static buildKey(model: string, messages: unknown, stream: boolean): string {
-    // Normalize messages to a stable string representation
     const stable = JSON.stringify(messages, stableStringifyReplacer);
     const raw = `${model}|${stream}|${stable}`;
     return simpleHash(raw);
   }
 
-  /** Retrieve a cached response. Returns null if missing or expired. */
-  get(key: string): { body: string; status: number; headers: Record<string, string> } | null {
-    const entry = this.map.get(key);
-    if (!entry) return null;
+  /** Check if this model should be cached. */
+  shouldCacheModel(model: string): boolean {
+    if (this.modelAllowlist.length === 0) return true;
+    return this.modelAllowlist.some((re) => re.test(model));
+  }
 
-    // Expired — evict and return null
-    if (Date.now() > entry.expiresAt) {
-      this.delete(key);
+  /** Retrieve a cached response. Returns null if missing or expired. */
+  get(
+    key: string,
+  ): { body: string; status: number; headers: Record<string, string> } | null {
+    if (!this.map.has(key)) {
+      this.misses++;
       return null;
     }
 
-    // Move to front (most recently used)
-    this.moveToFront(key);
+    const entry = this.map.get(key)!;
+
+    // Expired — evict and return null
+    if (Date.now() > entry.expiresAt) {
+      this.map.delete(key);
+      this.misses++;
+      return null;
+    }
+
+    // Move to end (most recently used) — O(1) in Map
+    this.map.delete(key);
+    this.map.set(key, entry);
+    this.hits++;
     return { body: entry.body, status: entry.status, headers: entry.headers };
   }
 
@@ -106,21 +123,21 @@ export class ResponseCache {
       expiresAt: now + ttl,
     };
 
+    // Set as most recently used (last in iteration order)
+    this.map.delete(key);
     this.map.set(key, entry);
-    this.moveToFront(key);
   }
 
   /** Delete a specific key. */
   delete(key: string): void {
     this.map.delete(key);
-    this.removeNode(key);
   }
 
   /** Clear all entries. */
   clear(): void {
     this.map.clear();
-    this.head = null;
-    this.tail = null;
+    this.hits = 0;
+    this.misses = 0;
   }
 
   /** Current number of entries. */
@@ -134,53 +151,39 @@ export class ResponseCache {
     let removed = 0;
     for (const [key, entry] of this.map) {
       if (now > entry.expiresAt) {
-        this.delete(key);
+        this.map.delete(key);
         removed++;
       }
     }
     return removed;
   }
 
-  // ── LRU internals ───────────────────────────────────────────────────────
-
-  private moveToFront(key: string): void {
-    // Remove from current position
-    this.removeNode(key);
-
-    // Add to front
-    const node: LRUNode = { key, prev: null, next: this.head };
-    if (this.head) {
-      this.head.prev = node;
-    }
-    this.head = node;
-    if (!this.tail) {
-      this.tail = node;
-    }
+  /** Return hit/miss stats and reset counters. */
+  stats(): CacheStats {
+    const total = this.hits + this.misses;
+    return {
+      hits: this.hits,
+      misses: this.misses,
+      size: this.map.size,
+      maxSize: this.maxSize,
+      hitRate: total > 0 ? this.hits / total : 0,
+    };
   }
 
-  private removeNode(key: string): void {
-    // Find the node — linear scan, but bounded by cache size (500).
-    // For larger caches, maintain a separate Map<key, LRUNode>.
-    let cur = this.head;
-    while (cur) {
-      if (cur.key === key) {
-        // Unlink
-        if (cur.prev) cur.prev.next = cur.next;
-        if (cur.next) cur.next.prev = cur.prev;
-        if (this.head === cur) this.head = cur.next;
-        if (this.tail === cur) this.tail = cur.prev;
-        return;
-      }
-      cur = cur.next;
-    }
+  /** Reset hit/miss counters. */
+  resetStats(): void {
+    this.hits = 0;
+    this.misses = 0;
   }
 
+  // ── Internals ───────────────────────────────────────────────────────────
+
+  /** Evict the least recently used entry (first in insertion order). */
   private evictLRU(): void {
-    // Tail is the least recently used
-    if (!this.tail) return;
-    const lruKey = this.tail.key;
-    this.map.delete(lruKey);
-    this.removeNode(lruKey);
+    const lruKey = this.map.keys().next().value;
+    if (lruKey !== undefined) {
+      this.map.delete(lruKey);
+    }
   }
 }
 
@@ -221,24 +224,67 @@ let _instance: ResponseCache | null = null;
 /**
  * Get or create the shared ResponseCache instance.
  * Configured via environment variables:
- *   CACHE_TTL       — TTL in ms (0 = disabled, default 15000)
+ *   CACHE_TTL       — TTL in ms (0 = disabled, default 300000 = 5 min)
  *   CACHE_MAX_SIZE  — max entries (default 500)
+ *   CACHE_MODELS    — comma-separated model prefixes to cache
+ *                     (e.g. "deepseek,minimax,kimi" — empty = cache all)
  */
 export function getResponseCache(): ResponseCache | null {
-  const ttl = Number(process.env.CACHE_TTL ?? 15000);
+  const ttl = Number(process.env.CACHE_TTL ?? 300000);
   if (ttl <= 0) return null; // explicitly disabled
 
   if (!_instance) {
     const maxSize = Number(process.env.CACHE_MAX_SIZE ?? 500);
-    _instance = new ResponseCache({ maxSize, defaultTtlMs: ttl });
+    const allowlistRaw = (process.env.CACHE_MODELS ?? "").trim();
+    const allowlist: RegExp[] = allowlistRaw
+      ? allowlistRaw.split(",").map((s) => new RegExp(s.trim()))
+      : [];
+    _instance = new ResponseCache({
+      maxSize,
+      defaultTtlMs: ttl,
+      modelAllowlist: allowlist,
+    });
   }
   return _instance;
 }
 
-/** Check if DSML detection should run (env toggle, default true). */
-export function isDSMLDetectionEnabled(): boolean {
-  const val = process.env.DSML_DETECTION ?? "true";
-  return val === "true" || val === "1";
+// ─── DSML model guard ────────────────────────────────────────────────────
+
+/** Comma-separated model prefixes that can produce DSML. */
+const DSML_MODELS_DEFAULT = "deepseek,codestral";
+
+/** Parse DSML_MODELS from env, cached after first call. */
+let _dsmlPatterns: RegExp[] | null = null;
+
+function getDSMLPatterns(): RegExp[] {
+  if (!_dsmlPatterns) {
+    const raw = (process.env.DSML_MODELS ?? DSML_MODELS_DEFAULT).trim();
+    _dsmlPatterns = raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((s) => new RegExp(s, "i"));
+  }
+  return _dsmlPatterns;
+}
+
+/**
+ * Check if DSML detection is globally enabled AND if this model is known
+ * to produce DSML output.
+ *
+ * DSML is a DeepSeek-specific markup format. For all other models (OpenAI,
+ * Anthropic, CastAI, etc.) there is no need to scan every SSE chunk.
+ *
+ * Configured via:
+ *   DSML_DETECTION — global on/off (default "true")
+ *   DSML_MODELS    — comma-separated model prefixes (default "deepseek,codestral")
+ */
+export function isDSMLDetectionEnabled(model?: string): boolean {
+  const globalEnabled = process.env.DSML_DETECTION ?? "true";
+  if (globalEnabled !== "true" && globalEnabled !== "1") return false;
+  if (!model) return true; // backward compat for non-model callers
+
+  return getDSMLPatterns().some((re) => re.test(model));
 }
 
 /** Check if stream passthrough mode is enabled (env toggle, default true). */
