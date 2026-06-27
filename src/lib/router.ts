@@ -558,7 +558,7 @@ async function handleRelay(
 	req: Request,
 	env: RouterEnv,
 	clientIP: string,
-	extra?: { ipv6Source?: string; skipProxyPool?: boolean },
+	extra?: { skipProxyPool?: boolean },
 ): Promise<Response> {
 	const startTime = performance.now();
 	const method = req.method;
@@ -603,7 +603,7 @@ async function handleRelay(
 	const result = await fetchWithRetry(
 		targetUrlString, fetchOptions,
 		extra?.skipProxyPool ? undefined : proxyPool!,
-		"relay", extra?.ipv6Source,
+		"relay",
 	);
 
 	if (result.errorClassification) {
@@ -678,7 +678,6 @@ export interface RouterOptions {
 	isWebSocketSupported?: boolean;
 	getTestApiHtml?: () => string | Promise<string>;
 	skipProxyPool?: boolean;
-	ipv6Source?: string;
 }
 
 async function handleRequest(
@@ -707,7 +706,7 @@ async function handleRequest(
 		if (authErr) return authErr;
 		try {
 			const body = await req.json();
-			return await handleChatCompletion(body, proxyPool ?? undefined, sessionPool ?? undefined, crypto.randomUUID(), options.ipv6Source);
+			return await handleChatCompletion(body, proxyPool ?? undefined, sessionPool ?? undefined, crypto.randomUUID());
 		} catch (err) {
 			return createJsonErrorResponse(err);
 		}
@@ -722,7 +721,7 @@ async function handleRequest(
 		try {
 			const body = await req.json();
 			const anthropicVersion = req.headers.get("anthropic-version") ?? undefined;
-			return await handleAnthropicMessages(body, proxyPool ?? undefined, sessionPool ?? undefined, crypto.randomUUID(), options.ipv6Source, anthropicVersion);
+			return await handleAnthropicMessages(body, proxyPool ?? undefined, sessionPool ?? undefined, crypto.randomUUID(), anthropicVersion);
 		} catch (err) {
 			return createAnthropicJsonErrorResponse(err);
 		}
@@ -755,7 +754,6 @@ async function handleRequest(
 
 	// Generic HTTP relay
 	return handleRelay(req, env, clientIP, {
-		ipv6Source: options.ipv6Source,
 		skipProxyPool: options.skipProxyPool,
 	});
 }

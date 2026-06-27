@@ -7,49 +7,8 @@ Key architecture facts:
 - Middleware stack: rate limiter, body limiter, structured logger, SSRF protection
 - WebSocket relay: bidirectional relay via `x-relay-target` header with `ws://` or `wss://`
 - Error classification: DNS errors -> 502, timeouts -> 504, SSRF blocks -> 403, rate limits -> 429
-- IPv6 support: dual-stack listen + outbound source rotation via `Bun.spawn` + `curl --interface`
 - The old Next.js `src/app/route.ts` still exists as a legacy file but is no longer the active entry point
 
-## IPv6 Configuration
-
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `HOST` | `::` | Bind address. Use `::` for dual-stack (IPv4+IPv6) |
-| `IPV6_SOURCES` | _(empty)_ | Comma-separated IPv6 source addresses for outbound rotation |
-
-### Setup
-
-1. Add IPv6 addresses to your interface:
-```bash
-ip -6 addr add 2001:df4:c140:1f::d6/128 dev eth0
-ip -6 addr add 2001:df4:c140:1f:ffff:ffff:ffff:ffff/128 dev eth0
-```
-
-2. Configure the proxy with IPv6 source rotation:
-```bash
-IPV6_SOURCES=2001:df4:c140:1f::d6,2001:df4:c140:1f:ffff:ffff:ffff:ffff bun run src/index.ts
-```
-
-### How It Works
-
-- **Listen**: Server binds to `::` (all IPv6 interfaces) with `ipv6Only: false` (dual-stack)
-- **Outbound**: When `IPV6_SOURCES` is configured, each outbound request rotates through the source addresses using `curl --interface <ipv6>`
-- **Failover**: Failed source addresses are automatically disabled after 3 consecutive failures
-
-### Source: `src/lib/ipv6-pool.ts`
-
-```typescript
-import { IPv6SourcePool } from "./lib/ipv6-pool";
-
-const pool = new IPv6SourcePool();
-pool.loadFromEnv(); // reads IPV6_SOURCES
-
-const source = pool.getNext(); // round-robin
-pool.markSuccess(source);      // reset failure count
-pool.markFailed(source);       // increment failure count
-```
 
 Default to using Bun instead of Node.js.
 

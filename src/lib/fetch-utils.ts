@@ -6,13 +6,6 @@
  */
 
 import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
-import type { IPv6SourcePool } from "./ipv6-pool";
-import { unlink } from "node:fs/promises";
-
-// ─── Constants ─────────────────────────────────────────────────────────
-
-/** Default relay timeout (30 seconds). Used for curl IPv6 source requests. */
-const DEFAULT_TIMEOUT_MS = 30_000;
 
 // ─── Active stream tracking (for graceful shutdown) ───────────────────────
 
@@ -129,7 +122,7 @@ export class SSELineBuffer {
     if (this.overflow) return [];
 
     this.buffer += chunk;
-    
+
     if (this.buffer.length > this.MAX_BUFFER_SIZE) {
       console.warn(`[SSELineBuffer] Buffer exceeded ${this.MAX_BUFFER_SIZE} bytes — discarding remaining stream data`);
       this.overflow = true;
@@ -219,142 +212,11 @@ export function sanitizeErrorMessage(raw: string): string {
   return "Upstream error";
 }
 
-// ─── Fetch via curl (for IPv6 source binding) ────────────────────────────
-
-/**
- * Execute an HTTP request via curl with a specific source IPv6 address.
- * Uses `Bun.spawn` to run curl with `--interface` to bind to the given address.
- *
- * This is used when outbound IPv6 source rotation is needed, since
- * Bun's built-in fetch() does not support specifying a local address.
- *
- * Status code is extracted from a temp file written by curl's `-w` flag
- * (written after body completes). The body is collected into a single
- * buffer and returned as a ReadableStream for zero-copy handoff.
- *
- * @param url - Target URL
- * @param init - Request init (method, headers, body)
- * @param ipv6Source - IPv6 source address to bind to
- * @param timeoutMs - Request timeout in milliseconds
- */
-export async function fetchViaCurl(
-	url: string,
-	init: RequestInit,
-	ipv6Source: string,
-	timeoutMs: number,
-): Promise<Response> {
-	const method = (init.method ?? "GET").toUpperCase();
-
-	const statusFile = `/tmp/curl-status-${crypto.randomUUID().slice(0, 8)}`;
-	const args = [
-		"curl",
-		"-6",
-		"--interface", ipv6Source,
-		"-X", method,
-		"-s",           // silent mode
-		"--compressed", // auto-decompress gzip/brotli
-		"-o", "-",      // output body to stdout
-		"-w", statusFile, // write status code to file (plain text, appended after body)
-		"--max-time", String(Math.ceil(timeoutMs / 1000)),
-		"--connect-timeout", "10",
-	];
-
-	// Add headers
-	if (init.headers) {
-		const headers = init.headers instanceof Headers
-			? Object.fromEntries(init.headers.entries())
-			: init.headers;
-		for (const [key, value] of Object.entries(headers)) {
-			if (key.toLowerCase() === "host") continue;
-			args.push("-H", `${key}: ${value}`);
-		}
-	}
-
-	// Add body for non-GET/HEAD methods
-	if (init.body && method !== "GET" && method !== "HEAD") {
-		if (typeof init.body === "string") {
-			args.push("-d", init.body);
-		} else if (init.body instanceof ArrayBuffer) {
-			args.push("--data-binary", "@-");
-		}
-	}
-
-	args.push(url);
-
-	logProxy("fetchViaCurl", `${args.slice(0, 6).join(" ")}...`, { ipv6Source, url });
-
-	const proc = Bun.spawn(args, {
-		stdout: "pipe",
-		stderr: "pipe",
-		stdin: "pipe",
-	});
-
-	// Kill process after timeout + buffer
-	const killTimer = setTimeout(() => {
-		try { proc.kill("SIGKILL"); } catch { /* already dead */ }
-	}, timeoutMs + 5000);
-
-	// Collect stdout into minimal chunks then concatenate into a single buffer.
-	// This is needed because curl's -w (status code) is written AFTER the body
-	// completes, so we must wait for proc.exited before reading the status file.
-	// We minimize peak memory by streaming chunks into a pre-allocated buffer.
-	const stdoutChunks: Uint8Array[] = [];
-	const stdoutReader = proc.stdout.getReader();
-	try {
-		while (true) {
-			const { done, value } = await stdoutReader.read();
-			if (done) break;
-			stdoutChunks.push(value);
-		}
-	} catch { /* stream cancelled */ }
-
-	// Wait for process to exit, then read status code
-	await proc.exited;
-	clearTimeout(killTimer);
-
-	let statusCode = 502;
-	try {
-		const statusText = await Bun.file(statusFile).text();
-		statusCode = parseInt(statusText.trim(), 10) || 502;
-	} catch {
-		// Status file not written — connection likely failed
-	}
-
-	// Clean up temp file (async, non-blocking)
-	unlink(statusFile).catch(() => {});
-
-	logProxy("fetchViaCurl", `response status=${statusCode}`, { ipv6Source, url });
-
-	// Concatenate chunks into a single buffer for the Response body stream.
-	// Uses a single allocation to reduce GC pressure from many small chunks.
-	const totalLength = stdoutChunks.reduce((sum, c) => sum + c.byteLength, 0);
-	const combined = new Uint8Array(totalLength);
-	let offset = 0;
-	for (const chunk of stdoutChunks) {
-		combined.set(chunk, offset);
-		offset += chunk.byteLength;
-	}
-
-	// Zero-copy: hand the buffer directly to ReadableStream
-	const bodyStream = new ReadableStream({
-		start(controller) {
-			controller.enqueue(combined);
-			controller.close();
-		},
-	});
-
-	return new Response(bodyStream, {
-		status: statusCode,
-		statusText: statusCode === 200 ? "OK" : "Error",
-		headers: { "Content-Type": "text/plain" },
-	});
-}
-
 // ─── Fetch with retry (direct → proxy fallback) ─────────────────────────
 
 export interface FetchWithRetryResult {
-	response?: Response;
-	errorClassification?: { code: string; status: number; message: string };
+  response?: Response;
+  errorClassification?: { code: string; status: number; message: string };
 }
 
 /**
@@ -364,17 +226,12 @@ export interface FetchWithRetryResult {
  * Falls back to direct when no pool is available.
  * Logs every failure to `console.warn` so the operator can diagnose without
  * the error body leaking to the downstream client.
- *
- * @param ipv6Source - Optional IPv6 source address for outbound binding.
- *                     When provided, uses curl instead of fetch() to bind
- *                     to the specified source address.
  */
 export async function fetchWithRetry(
-	url: string,
-	init: RequestInit & { proxy?: string },
-	proxyPool?: ProxyPool,
-	context?: string,
-	ipv6Source?: string,
+  url: string,
+  init: RequestInit & { proxy?: string },
+  proxyPool?: ProxyPool,
+  context?: string,
 ): Promise<FetchWithRetryResult> {
   let response: Response | undefined;
   let lastError: unknown;
@@ -419,22 +276,9 @@ export async function fetchWithRetry(
     const proxyShort = init.proxy ? init.proxy.replace(/https?:\/\//, "").replace(/@.*/, "@***") : "direct";
     logProxy("fetchWithRetry", `attempt=${attempt + 1}/${maxAttempts} proxy=${proxyShort}`, { context });
 
-	try {
-			// Use curl for IPv6 source binding (only for direct connections)
-			if (ipv6Source && !init.proxy) {
-				response = await fetchViaCurl(url, init, ipv6Source, DEFAULT_TIMEOUT_MS);
-				// If curl failed with connection error (502, empty body), fallback to regular fetch
-				if (response.status === 502) {
-					const cloned = response.clone();
-					const bodyText = await cloned.text();
-					if (!bodyText) {
-						logProxy("fetchWithRetry", `IPv6 connection failed, falling back to regular fetch`, { ipv6Source, url });
-						response = await fetch(url, init);
-					}
-				}
-			} else {
-				response = await fetch(url, init);
-			}
+    try {
+      response = await fetch(url, init);
+
       if (response.ok) {
         if (usedProxy && proxyPool && proxyPool.size > 0) {
           proxyPool.markSuccess();
@@ -542,8 +386,6 @@ function classifyFetchErrorSafe(error: unknown): {
  * SSE streams: the initial request is retried normally. Once the response body
  * starts streaming, mid-stream errors are **not** retried; the session is
  * released and the error is returned to the caller.
- *
- * @param ipv6Source - Optional IPv6 source address for outbound binding.
  */
 export async function fetchWithSessionRetry(
   url: string,
@@ -552,18 +394,12 @@ export async function fetchWithSessionRetry(
   sessionId: string,
   context?: string,
   maxRetries?: number,
-  ipv6Source?: string,
 ): Promise<FetchWithRetryResult> {
   // Fallback when no session pool is available
   if (!sessionPool) {
     logProxy("fetchWithSessionRetry", "no session pool — direct fetch", { context, sessionId: sessionId.slice(0, 8) });
     try {
-      let response: Response;
-      if (ipv6Source) {
-        response = await fetchViaCurl(url, init, ipv6Source, DEFAULT_TIMEOUT_MS);
-      } else {
-        response = await fetch(url, init);
-      }
+      const response = await fetch(url, init);
       return { response };
     } catch (err) {
       return { errorClassification: classifyFetchErrorSafe(err) };
@@ -620,13 +456,7 @@ export async function fetchWithSessionRetry(
     });
 
     try {
-      // Use curl for IPv6 source binding (only for direct connections)
-      let response: Response;
-      if (ipv6Source && !init.proxy) {
-        response = await fetchViaCurl(url, init, ipv6Source, DEFAULT_TIMEOUT_MS);
-      } else {
-        response = await fetch(url, init);
-      }
+      const response = await fetch(url, init);
 
       if (response.ok) {
         sessionPool.markSuccess(sessionId);
@@ -650,7 +480,7 @@ export async function fetchWithSessionRetry(
           context,
           sessionId: sessionId.slice(0, 8),
         });
-        const rotated = sessionPool.rotateNow(sessionId, model);
+        sessionPool.rotateNow(sessionId, model);
         continue;
       }
 

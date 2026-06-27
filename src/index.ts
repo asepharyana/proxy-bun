@@ -5,7 +5,6 @@
  * Adds:
  *   - Bun.serve() bindings
  *   - WebSocket relay support
- *   - IPv6 source rotation
  *   - Proxy pool file loading
  *   - Graceful shutdown
  */
@@ -25,7 +24,6 @@ import {
 } from "./lib/router";
 import type { RouterEnv } from "./lib/router";
 
-import { IPv6SourcePool } from "./lib/ipv6-pool";
 import { closeAllActiveReaders, isDevMode } from "./lib/fetch-utils";
 
 import type { Server, ServerWebSocket } from "bun";
@@ -34,7 +32,7 @@ import type { Server, ServerWebSocket } from "bun";
 
 const RELAY_VERSION = "1.0.0";
 const PORT = Number.parseInt(process.env.PORT ?? "3000", 10);
-const HOST = process.env.HOST ?? "::";
+const HOST = process.env.HOST ?? "0.0.0.0";
 
 // --- Proxy pool (optional) ----------------------------------------------------
 
@@ -42,14 +40,6 @@ const proxyPool = getSharedProxyPool();
 proxyPool.tryLoad(
 	process.env.PROXY_FILE || process.env.PROXY_LIST || "./proxy.txt",
 );
-
-// --- IPv6 source pool (optional) ----------------------------------------------
-
-const ipv6Pool = new IPv6SourcePool();
-ipv6Pool.loadFromEnv();
-if (ipv6Pool.configured) {
-	console.log(`[relay] IPv6 source pool loaded: ${ipv6Pool.size} addresses`);
-}
 
 // --- SSRF DNS rebinding protection --------------------------------------------
 
@@ -116,13 +106,11 @@ function handleWebSocketUpgrade(
 
 const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 	hostname: HOST,
-	ipv6Only: false,
 	port: PORT,
 	development: isDevMode() ? { hmr: true, console: true } : undefined,
 
 	async fetch(req: Request): Promise<Response | undefined> {
 		const url = new URL(req.url);
-		const ipv6Source = ipv6Pool.getNext() ?? undefined;
 
 		// Static routes
 		if (url.pathname === "/health") return handleHealth();
@@ -157,10 +145,7 @@ const server: Server<WSRelayData> = Bun.serve<WSRelayData>({
 			req,
 			routerEnv,
 			clientIP,
-			{
-				isWebSocketSupported: true,
-				ipv6Source,
-			},
+			{ isWebSocketSupported: true },
 		);
 		if (result !== undefined) return result;
 

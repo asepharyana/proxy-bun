@@ -407,14 +407,6 @@ export async function handleChatCompletion(
 	proxyPool?: ProxyPool,
 	sessionPool?: SessionProxyPool,
 	sessionId?: string,
-	ipv6Source?: string,
-): Promise<Response>;
-export async function handleChatCompletion(
-	body: unknown,
-	proxyPool?: ProxyPool,
-	sessionPool?: SessionProxyPool,
-	sessionId?: string,
-	ipv6Source?: string,
 ): Promise<Response> {
 	// -- Input validation -------------------------------------------------------
 	const validationError = validateChatRequest(body);
@@ -457,8 +449,8 @@ export async function handleChatCompletion(
 	// -- Execute with session-aware or standard retry --------------------------
 	let result: FetchWithRetryResult =
 		sessionPool && sessionId
-			? await fetchWithSessionRetry(url, init, sessionPool, sessionId, `openai:${req.model}`, undefined, ipv6Source)
-			: await fetchWithRetry(url, init, proxyPool, `openai:${req.model}`, ipv6Source);
+			? await fetchWithSessionRetry(url, init, sessionPool, sessionId, `openai:${req.model}`, undefined)
+			: await fetchWithRetry(url, init, proxyPool, `openai:${req.model}`);
 
 	// -- Mimo Free: auth failure → invalidate JWT and retry once ---------------
 	if (
@@ -474,8 +466,8 @@ export async function handleChatCompletion(
 		};
 		result =
 			sessionPool && sessionId
-				? await fetchWithSessionRetry(url, init, sessionPool, sessionId, `openai:${req.model}`, undefined, ipv6Source)
-				: await fetchWithRetry(url, init, proxyPool, `openai:${req.model}`, ipv6Source);
+				? await fetchWithSessionRetry(url, init, sessionPool, sessionId, `openai:${req.model}`, undefined)
+				: await fetchWithRetry(url, init, proxyPool, `openai:${req.model}`);
 	}
 
 	if (result.errorClassification) {
