@@ -15,6 +15,7 @@ import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
 import { fetchWithRetry, fetchWithSessionRetry, SSELineBuffer, isDevMode, trackReader, releaseReader, wrapStreamWithCleanup, type FetchWithRetryResult } from "./fetch-utils";
 import { getJwt, invalidateJwt } from "./mimo-auth";
 import { parseDSML, looksLikeDSML } from "./dsml-parser";
+import { getResponseCache, isDSMLDetectionEnabled, isStreamPassthroughEnabled, ResponseCache } from "./response-cache";
 
 // --- Kimchi API Key (hardcoded untuk deployability di Vercel/CF) --------------
 const KIMCHI_API_KEY = "castai_v1_c5b9f4751ccb6c187c7e2f1cb2efbf83ac5d4e22806fd1d7218a0f602fee1777_1d96b89c";
@@ -428,6 +429,24 @@ export async function handleChatCompletion(
 	const wantsStream = req.stream === true;
 	const { url, init } = buildBackendRequest(req, config);
 
+	// -- Cache check (non-streaming only) ------------------------------------
+	const cache = getResponseCache();
+	const cacheKey = !wantsStream && cache
+		? ResponseCache.buildKey(req.model, req.messages, wantsStream)
+		: null;
+	if (cacheKey && cache) {
+		const cached = cache.get(cacheKey);
+		if (cached) {
+			if (isDevMode()) {
+				console.log(`[ai-proxy] cache HIT for model=${req.model} key=${cacheKey.slice(0, 12)}`);
+			}
+			return new Response(cached.body, {
+				status: cached.status,
+				headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", ...cached.headers },
+			});
+		}
+	}
+
 	// -- Mimo Free: inject JWT authentication and session affinity --------------
 	if (config.provider === "mimo-free") {
 		const jwt = await getJwt();
@@ -502,8 +521,11 @@ export async function handleChatCompletion(
 		const contentType = response.headers.get("content-type") ?? "";
 		const isNativeStream = contentType.includes("text/event-stream");
 
-		if (isNativeStream && (config.provider === "opencode" || config.provider === "mimo-free" || config.provider === "castai")) {
-			// Passthrough for OpenAI-compatible SSE
+		if (isNativeStream && isStreamPassthroughEnabled()) {
+			// Generic passthrough for all native SSE backends (no transform overhead).
+			// Previously this was restricted to known provider names; now it trusts
+			// the upstream content-type header, which is more generic and catches
+			// any new backend that speaks SSE natively.
 			const headers: Record<string, string> = {
 				"Content-Type": "text/event-stream",
 				"Cache-Control": "no-cache",
@@ -517,7 +539,7 @@ export async function handleChatCompletion(
 			);
 		}
 
-		// Transform the stream
+		// Transform the stream (for non-SSE or passthrough-disabled backends)
 		const transformed = transformStream(
 			response.body!,
 			config,
@@ -544,6 +566,15 @@ export async function handleChatCompletion(
 		sessionPool.release(sessionId);
 	}
 	const adapted = parseJSONResponse(text, config, req);
+
+	// -- Store in cache --------------------------------------------------------
+	if (cacheKey && cache) {
+		const responseBody = JSON.stringify(adapted);
+		cache.set(cacheKey, responseBody, 200, {});
+		if (isDevMode()) {
+			console.log(`[ai-proxy] cache MISS for model=${req.model} key=${cacheKey.slice(0, 12)} — stored`);
+		}
+	}
 
 	return new Response(JSON.stringify(adapted), {
 		status: 200,
@@ -586,7 +617,7 @@ function transformStream(
 
 	// DSML accumulation: buffer text deltas to detect DSML across chunks
 	let dsmlAccumulated = "";
-	let dsmlDetecting = true;
+	let dsmlDetecting = isDSMLDetectionEnabled();
 
 	function startKeepalive(controller: ReadableStreamDefaultController) {
 		if (keepaliveTimer) return;

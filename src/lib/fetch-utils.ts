@@ -238,9 +238,10 @@ export async function fetchWithRetry(
   let usedProxy = false;
 
   // Strategy: direct first, then proxies as fallback.
-  // maxAttempts = 1 direct + pool.size proxies, min 3 (all direct if no pool).
+  // Default: 2 attempts (1 direct + 1 proxy fallback). Override via MAX_RETRIES env.
+  const MAX_RETRIES = Number(process.env.MAX_RETRIES ?? 2);
   const poolSize = proxyPool?.size ?? 0;
-  const maxAttempts = poolSize > 0 ? poolSize + 1 : 3;
+  const maxAttempts = Math.min(MAX_RETRIES, poolSize > 0 ? poolSize + 1 : MAX_RETRIES);
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     // Exponential backoff between attempts (skip on first attempt)
@@ -407,8 +408,9 @@ export async function fetchWithSessionRetry(
   }
 
   // Strategy: direct first, then session-sticky proxies as fallback.
-  // totalAttempts = 1 direct + sessionPool.size proxies, min 3.
-  const totalAttempts = maxRetries ?? Math.max(3, sessionPool.size + 1);
+  // Default: 2 attempts (1 direct + 1 proxy fallback). Override via MAX_RETRIES env.
+  const MAX_RETRIES = Number(process.env.MAX_RETRIES ?? 2);
+  const totalAttempts = maxRetries ?? Math.min(MAX_RETRIES, Math.max(2, sessionPool.size + 1));
   let lastError: unknown;
   let lastResponse: Response | undefined;
   for (let attempt = 0; attempt < totalAttempts; attempt++) {

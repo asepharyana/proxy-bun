@@ -14,6 +14,7 @@ import type { ProxyPool, SessionProxyPool } from "./proxy-pool";
 import { MODEL_ROUTES, type BackendConfig } from "./ai-proxy";
 import { fetchWithRetry, fetchWithSessionRetry, SSELineBuffer, isDevMode, trackReader, releaseReader, wrapStreamWithCleanup, type FetchWithRetryResult } from "./fetch-utils";
 import { parseDSML, looksLikeDSML, isCompleteDSML } from "./dsml-parser";
+import { getResponseCache, isDSMLDetectionEnabled, ResponseCache } from "./response-cache";
 
 // --- Types -------------------------------------------------------------------
 
@@ -692,7 +693,7 @@ async function processStreamChunk(
 	config: BackendConfig,
 	usage: AnthropicResponse["usage"],
 	outputCounter: OutputCounter,
-	dsmlBuffer?: DSMLStreamBuffer,
+	dsmlBuffer?: DSMLStreamBuffer | null,
 ): Promise<boolean> {
 	const { done, value } = await reader.read();
 	if (done) {
@@ -790,7 +791,7 @@ function transformAnthropicStream(
 	let phase: "init" | "block" | "done" = "init";
 	const outputCounter: OutputCounter = { chars: 0 };
 	const usage: AnthropicResponse["usage"] = { input_tokens: 0, output_tokens: 0 };
-	const dsmlBuffer = createDSMLStreamBuffer();
+	const dsmlBuffer = isDSMLDetectionEnabled() ? createDSMLStreamBuffer() : null;
 
 	let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
 	const KEEPALIVE_INTERVAL_MS = 15_000;
@@ -836,7 +837,7 @@ function transformAnthropicStream(
 				}
 
 				if (phase === "done") {
-					const dsmlText = dsmlBuffer.flush();
+					const dsmlText = dsmlBuffer?.flush() ?? null;
 					emitDoneEvents(controller, encoder, usage, outputCounter, dsmlText);
 				}
 			} catch (err) {
@@ -1059,6 +1060,24 @@ export async function handleAnthropicMessages(
 	// Default anthropic-version to 2023-06-01 (required for prompt caching).
 	const version = anthropicVersion || "2023-06-01";
 
+	// -- Cache check (non-streaming only) ------------------------------------
+	const cache = getResponseCache();
+	const cacheKey = !wantsStream && cache
+		? ResponseCache.buildKey(req.model, req.messages, wantsStream)
+		: null;
+	if (cacheKey && cache) {
+		const cached = cache.get(cacheKey);
+		if (cached) {
+			if (isDevMode()) {
+				console.log(`[anthropic-proxy] cache HIT for model=${req.model} key=${cacheKey.slice(0, 12)}`);
+			}
+			return new Response(cached.body, {
+				status: cached.status,
+				headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", ...cached.headers },
+			});
+		}
+	}
+
 	// Translate Anthropic -> backend
 	const { body: backendBody, headers: extraHeaders } = anthropicToBackend(
 		req, config, backendModel, version,
@@ -1148,6 +1167,16 @@ export async function handleAnthropicMessages(
 	}
 
 	const adapted = backendToAnthropicResponse(parsed, req.model);
+
+	// -- Store in cache --------------------------------------------------------
+	if (cacheKey && cache) {
+		const responseBody = JSON.stringify(adapted);
+		cache.set(cacheKey, responseBody, 200, {});
+		if (isDevMode()) {
+			console.log(`[anthropic-proxy] cache MISS for model=${req.model} key=${cacheKey.slice(0, 12)} — stored`);
+		}
+	}
+
 	return new Response(JSON.stringify(adapted), {
 		status: 200,
 		headers: buildJsonHeaders(response),
