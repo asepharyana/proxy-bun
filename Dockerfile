@@ -15,7 +15,7 @@ COPY src/ src/
 COPY public/ public/
 COPY proxy.txt ./
 
-EXPOSE 3000
+EXPOSE 4090
 
 USER bun
 
