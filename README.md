@@ -22,7 +22,7 @@ bun run dev       # development with HMR
 bun start         # production
 ```
 
-The server starts on `http://localhost:3000` by default.
+The server starts on `http://localhost:4090` by default.
 
 | Provider | Endpoint |
 |----------|----------|
@@ -97,7 +97,7 @@ Include the `x-relay-target` header to specify the upstream URL. Method, body, h
 
 ```bash
 curl -H "x-relay-target: https://jsonplaceholder.typicode.com/posts/1" \
-     http://localhost:3000/
+     http://localhost:4090/
 ```
 
 **POST with body and authorization:**
@@ -109,7 +109,7 @@ curl -X POST \
      -H "Authorization: Bearer sk-..." \
      -H "Content-Type: application/json" \
      -d '{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]}' \
-     http://localhost:3000/
+     http://localhost:4090/
 ```
 
 **Binary upload (streaming):**
@@ -119,7 +119,7 @@ curl -X PUT \
      -H "x-relay-target: https://storage.example.com" \
      -H "x-relay-path: /upload/image.png" \
      --data-binary "@/path/to/image.png" \
-     http://localhost:3000/
+     http://localhost:4090/
 ```
 
 ### Supported Methods
@@ -151,7 +151,7 @@ The relay handles text frames, binary frames (`Buffer`, `Uint8Array`, `ArrayBuff
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PORT` | `3000` | Server listen port |
+| `PORT` | `4090` | Server listen port |
 | `HOST` | `0.0.0.0` | Bind address |
 | `NODE_ENV` / `BUN_ENV` | — | Set to `development` to enable HMR + verbose console |
 
@@ -359,7 +359,7 @@ Deploy as a standalone Bun process. No framework adapter required.
 bun src/index.ts
 
 # With environment overrides
-PORT=8080 CACHE_TTL=600000 bun src/index.ts
+PORT=4090 CACHE_TTL=600000 bun src/index.ts
 ```
 
 ### Deployment Targets
@@ -374,7 +374,7 @@ PORT=8080 CACHE_TTL=600000 bun src/index.ts
   COPY package.json bun.lock .
   RUN bun install
   COPY . .
-  EXPOSE 3000
+  EXPOSE 4090
   CMD ["bun", "src/index.ts"]
   ```
 

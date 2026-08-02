@@ -31,7 +31,7 @@ import type { Server, ServerWebSocket } from "bun";
 // --- Configuration ------------------------------------------------------------
 
 const RELAY_VERSION = "1.0.0";
-const PORT = Number.parseInt(process.env.PORT ?? "3000", 10);
+const PORT = Number.parseInt(process.env.PORT ?? "4090", 10);
 const HOST = process.env.HOST ?? "0.0.0.0";
 
 // --- Proxy pool (optional) ----------------------------------------------------
