@@ -4,20 +4,7 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
-      day: "monday"
-      time: "05:00"
-      timezone: "Asia/Makassar"
     open-pull-requests-limit: 10
-    assignees:
-      - "asepharyana"
-    commit-message:
-      prefix: "chore"
-      prefix-development: "chore"
-      include: "scope"
-    reviewers:
-      - "asepharyana"
-    labels:
-      - "dependencies"
     groups:
       production:
         dependency-type: "production"
