@@ -369,7 +369,7 @@ PORT=4090 CACHE_TTL=600000 bun src/index.ts
 - **Docker**:
 
   ```dockerfile
-  FROM oven/bun:latest
+  FROM oven/bun:1.4-alpine
   WORKDIR /app
   COPY package.json bun.lock .
   RUN bun install

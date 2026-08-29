@@ -1,6 +1,6 @@
 {
   "framework": null,
-  "bunVersion": "1.x",
+  "bunVersion": "1.4.0",
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/relay" }
   ]

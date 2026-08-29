@@ -1,4 +1,4 @@
-FROM oven/bun:1.3-alpine
+FROM oven/bun:1.4-alpine
 WORKDIR /app
 
 # Install curl for IPv6 source rotation
